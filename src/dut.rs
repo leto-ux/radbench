@@ -17,10 +17,13 @@ fn main() {
         .unwrap_or_else(|_| "0".into())
         .parse()
         .unwrap();
-    let uart_path = std::env::var("RADBENCH_UART").unwrap_or_else(|_| "/dev/ttyS0".into());
+    let uart_path = std::env::var("RADBENCH_UART").ok();
     let monitor_addr =
         std::env::var("RADBENCH_MONITOR").unwrap_or_else(|_| "192.168.1.100:9000".into());
     let log_path = std::env::var("RADBENCH_LOG").unwrap_or_else(|_| "/root/radbench.log".into());
+
+    // Unique run_id so the monitor can distinguish restarts
+    let run_id = format!("{:08x}", now_ms() & 0xFFFFFFFF);
 
     core_affinity::set_for_current(core_affinity::CoreId { id: cpu });
 
@@ -28,21 +31,40 @@ fn main() {
     let iter = Arc::new(AtomicU64::new(0));
     let iter_hb = Arc::clone(&iter);
 
-    // Logger thread: local file + UART + TCP
+    // Logger thread: local file + optional UART + reconnecting TCP
     let logger = {
         let core = core.clone();
         let log_path = log_path.clone();
+        let monitor_addr = monitor_addr.clone();
         thread::spawn(move || {
             let mut file = OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(&log_path)
                 .unwrap();
-            let mut uart = serialport::new(&uart_path, 115_200)
-                .timeout(Duration::from_millis(100))
-                .open()
-                .ok();
-            let mut tcp = TcpStream::connect(&monitor_addr).ok();
+
+            // UART is optional — only open if RADBENCH_UART is set
+            let mut uart = uart_path.as_ref().and_then(|p| {
+                match serialport::new(p, 115_200)
+                    .timeout(Duration::from_millis(100))
+                    .open()
+                {
+                    Ok(port) => {
+                        eprintln!("[logger] UART {} opened", p);
+                        Some(port)
+                    }
+                    Err(e) => {
+                        eprintln!("[logger] UART {} unavailable: {}", p, e);
+                        None
+                    }
+                }
+            });
+
+            // TCP with reconnect
+            let mut tcp: Option<TcpStream> = None;
+            let mut tcp_backoff = Duration::from_secs(1);
+            let mut tcp_last_attempt = Instant::now() - tcp_backoff;
+
             let mut seq = 0u64;
 
             for pkt in rx {
@@ -51,7 +73,7 @@ fn main() {
                 pkt.seq = seq;
                 let line = serde_json::to_string(&pkt).unwrap();
 
-                // Local file with fsync
+                // local file with fsync
                 let _ = writeln!(file, "{}", line);
                 let _ = file.flush();
                 unsafe {
@@ -63,12 +85,32 @@ fn main() {
                     let _ = writeln!(u, "{}", line);
                 }
 
-                // TCP
+                // TCP — reconnect if disconnected
+                if tcp.is_none() && tcp_last_attempt.elapsed() >= tcp_backoff {
+                    tcp_last_attempt = Instant::now();
+                    match TcpStream::connect(&monitor_addr) {
+                        Ok(s) => {
+                            eprintln!("[logger] TCP connected to {}", monitor_addr);
+                            tcp = Some(s);
+                            tcp_backoff = Duration::from_secs(1);
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[logger] TCP connect to {} failed: {} (retry in {:?})",
+                                monitor_addr, e, tcp_backoff
+                            );
+                            tcp_backoff = (tcp_backoff * 2).min(Duration::from_secs(30));
+                        }
+                    }
+                }
                 if let Some(t) = tcp.as_mut() {
-                    let _ = writeln!(t, "{}", line);
+                    if writeln!(t, "{}", line).is_err() {
+                        eprintln!("[logger] TCP write failed, will reconnect");
+                        tcp = None;
+                    }
                 }
 
-                // Periodic log integrity packet
+                // log integrity
                 if seq % 500 == 0 {
                     let meta = file.metadata().unwrap();
                     let crc = crc32_file(&log_path);
@@ -76,6 +118,7 @@ fn main() {
                         seq: seq + 1,
                         ts: now_ms(),
                         source: format!("dut-{}", core),
+                        run_id: None,
                         event: Event::LogIntegrity {
                             file: log_path.clone(),
                             bytes: meta.len(),
@@ -92,16 +135,20 @@ fn main() {
                         let _ = writeln!(u, "{}", line);
                     }
                     if let Some(t) = tcp.as_mut() {
-                        let _ = writeln!(t, "{}", line);
+                        if writeln!(t, "{}", line).is_err() {
+                            eprintln!("[logger] TCP write failed, will reconnect");
+                            tcp = None;
+                        }
                     }
                 }
             }
         })
     };
 
-    // Heartbeat thread
+    // heartbeat
     let tx_hb = tx.clone();
     let core_hb = core.clone();
+    let run_id_hb = run_id.clone();
     thread::spawn(move || {
         loop {
             thread::sleep(Duration::from_secs(1));
@@ -109,6 +156,7 @@ fn main() {
                 seq: 0,
                 ts: now_ms(),
                 source: format!("dut-{}", core_hb),
+                run_id: Some(run_id_hb.clone()),
                 event: Event::Heartbeat {
                     core: core_hb.clone(),
                     iter: iter_hb.load(Ordering::Relaxed),
@@ -118,9 +166,10 @@ fn main() {
         }
     });
 
-    // Memory test thread
+    // mem threadx
     let tx_mem = tx.clone();
     let core_mem = core.clone();
+    let run_id_mem = run_id.clone();
     thread::spawn(move || {
         loop {
             thread::sleep(Duration::from_secs(10));
@@ -129,6 +178,7 @@ fn main() {
                     seq: 0,
                     ts: now_ms(),
                     source: format!("dut-{}", core_mem),
+                    run_id: Some(run_id_mem.clone()),
                     event: Event::Error {
                         core: core_mem.clone(),
                         test: "mem_march".into(),
@@ -142,14 +192,13 @@ fn main() {
         }
     });
 
-    // Run main workload
-    run_fib(&core, &tx, &iter);
+    run_fib(&core, &tx, &iter, &run_id);
 
-    // Graceful shutdown on SIGTERM/SIGINT would send Shutdown packet here
+    // graceful shutdown on SIGTERM/SIGINT would send sh packet here
     logger.join().unwrap();
 }
 
-fn run_fib(core: &str, tx: &Sender<Packet>, iter: &AtomicU64) {
+fn run_fib(core: &str, tx: &Sender<Packet>, iter: &AtomicU64, run_id: &str) {
     let checkpoints = reference::checkpoints();
     let mut a: u128 = 0;
     let mut b: u128 = 1;
@@ -169,8 +218,8 @@ fn run_fib(core: &str, tx: &Sender<Packet>, iter: &AtomicU64) {
             let mut h = Sha256::new();
             h.update(exact.to_bytes_be());
             let computed = hex::encode(h.finalize());
-            let expected = &checkpoints[cp_idx].expected_hash;
-            let status = if &computed == expected {
+            let expected = checkpoints[cp_idx].expected_hash;
+            let status = if computed == expected {
                 Status::Ok
             } else {
                 Status::Mismatch
@@ -181,6 +230,7 @@ fn run_fib(core: &str, tx: &Sender<Packet>, iter: &AtomicU64) {
                 seq: 0,
                 ts: now_ms(),
                 source: format!("dut-{}", core),
+                run_id: Some(run_id.to_string()),
                 event: Event::Checkpoint {
                     core: core.to_string(),
                     test: "fib".into(),
@@ -198,12 +248,13 @@ fn run_fib(core: &str, tx: &Sender<Packet>, iter: &AtomicU64) {
                     seq: 0,
                     ts: now_ms(),
                     source: format!("dut-{}", core),
+                    run_id: Some(run_id.to_string()),
                     event: Event::Error {
                         core: core.to_string(),
                         test: "fib".into(),
                         n,
                         computed: Some(computed),
-                        expected: Some(expected.clone()),
+                        expected: Some(expected.to_string()),
                         reason: "checkpoint hash mismatch".into(),
                     },
                 })

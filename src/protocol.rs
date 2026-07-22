@@ -1,10 +1,12 @@
-use serde::{Deserialize, Serializer};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Packet {
     pub seq: u64,
     pub ts: u64,
     pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     pub event: Event,
 }
 

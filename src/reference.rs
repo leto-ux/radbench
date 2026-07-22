@@ -4,20 +4,14 @@ use sha2::{Digest, Sha256};
 
 pub struct Checkpoint {
     pub n: u64,
-    pub expected_hash: String,
+    pub expected_hash: &'static str,
 }
 
-// bottom of the barrel generated idea, not sure what the complexity of this algorithm is
-pub fn checkpoints() -> Vec<Checkpoint> {
-    let indices = [1_000, 10_000, 100_000, 1_000_000, 5_000_000, 10_000_000];
-    // why is map syntax so gross
-    indices
-        .iter()
-        .map(|&n| Checkpoint {
-            n,
-            expected_hash: hash_fib(n),
-        })
-        .collect()
+// Precomputed at build time by build.rs — no runtime BigUint cost
+include!(concat!(env!("OUT_DIR"), "/reference_hashes.rs"));
+
+pub fn checkpoints() -> &'static [Checkpoint] {
+    CHECKPOINTS
 }
 
 pub fn hash_fib(n: u64) -> String {
@@ -39,7 +33,7 @@ pub fn fib(n: u64) -> BigUint {
         let c = &a * (&b * 2u32 - &a);
         let d = &a * &a + &b * &b;
         if n & (1u64 << bit) != 0 {
-            a = d;
+            a = d.clone();
             b = c + d;
         } else {
             a = c;

@@ -2,14 +2,15 @@
 name = "radbench"
 version = "0.1.0"
 edition = "2024"
+build = "src/build.rs"
 
 [[bin]]
 name = "dut"
-path = "src/bin/dut.rs"
+path = "src/dut.rs"
 
 [[bin]]
 name = "monitor"
-path = "src/bin/monitor.rs"
+path = "src/monitor.rs"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
@@ -22,3 +23,9 @@ serialport = "4.2"
 chrono = "0.4"
 core_affinity = "0.8"
 libc = "0.2"
+
+[build-dependencies]
+num-bigint = "0.4"
+num-traits = "0.2"
+sha2 = "0.10"
+hex = "0.4"
