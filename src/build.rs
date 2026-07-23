@@ -1,10 +1,9 @@
-use num_bigint::BigUint;
-use num_traits::{One, Zero};
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
+// calculate hashes to compare the dut outputs against during compile time
 fn main() {
     let out_dir = std::env::var("OUT_DIR").unwrap();
     let dest = Path::new(&out_dir).join("reference_hashes.rs");
@@ -14,7 +13,8 @@ fn main() {
 
     writeln!(f, "pub static CHECKPOINTS: &[Checkpoint] = &[").unwrap();
     for &n in &indices {
-        let hash = hash_fib(n);
+        let (a, b) = fib_u128_at(n);
+        let hash = hash_state(a, b);
         writeln!(
             f,
             "    Checkpoint {{ n: {}, expected_hash: {:?} }},",
@@ -24,33 +24,23 @@ fn main() {
     }
     writeln!(f, "];").unwrap();
 
-    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=src/build.rs");
 }
 
-fn hash_fib(n: u64) -> String {
-    let f = fib(n);
+fn fib_u128_at(n: u64) -> (u128, u128) {
+    let mut a: u128 = 0;
+    let mut b: u128 = 1;
+    for _ in 0..n {
+        let c = a.wrapping_add(b);
+        a = b;
+        b = c;
+    }
+    (a, b)
+}
+
+fn hash_state(a: u128, b: u128) -> String {
     let mut h = Sha256::new();
-    h.update(f.to_bytes_be());
+    h.update(a.to_le_bytes());
+    h.update(b.to_le_bytes());
     hex::encode(h.finalize())
-}
-
-fn fib(n: u64) -> BigUint {
-    if n == 0 {
-        return BigUint::zero();
-    }
-    let mut a = BigUint::zero();
-    let mut b = BigUint::one();
-    let highest = 63 - n.leading_zeros();
-    for bit in (0..=highest).rev() {
-        let c = &a * (&b * 2u32 - &a);
-        let d = &a * &a + &b * &b;
-        if n & (1u64 << bit) != 0 {
-            a = d.clone();
-            b = c + d;
-        } else {
-            a = c;
-            b = d;
-        }
-    }
-    a
 }

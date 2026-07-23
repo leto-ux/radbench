@@ -1,6 +1,7 @@
+use radbench::fault::{FaultInjector, FaultMode, FaultTarget};
 use radbench::protocol::{Event, Packet, Status};
 use radbench::reference;
-use sha2::{Digest, Sha256};
+use radbench::workload::FibState;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::TcpStream;
@@ -29,7 +30,9 @@ fn main() {
 
     let (tx, rx) = channel::<Packet>();
     let iter = Arc::new(AtomicU64::new(0));
+    let epoch = Arc::new(AtomicU64::new(0));
     let iter_hb = Arc::clone(&iter);
+    let epoch_hb = Arc::clone(&epoch);
 
     // Logger thread: local file + optional UART + reconnecting TCP
     let logger = {
@@ -159,6 +162,7 @@ fn main() {
                 run_id: Some(run_id_hb.clone()),
                 event: Event::Heartbeat {
                     core: core_hb.clone(),
+                    epoch: epoch_hb.load(Ordering::Relaxed),
                     iter: iter_hb.load(Ordering::Relaxed),
                     temp_milli: read_temp(),
                 },
@@ -166,7 +170,7 @@ fn main() {
         }
     });
 
-    // mem threadx
+    // mem march
     let tx_mem = tx.clone();
     let core_mem = core.clone();
     let run_id_mem = run_id.clone();
@@ -182,6 +186,7 @@ fn main() {
                     event: Event::Error {
                         core: core_mem.clone(),
                         test: "mem_march".into(),
+                        epoch: 0,
                         n: 0,
                         computed: None,
                         expected: None,
@@ -192,39 +197,80 @@ fn main() {
         }
     });
 
-    run_fib(&core, &tx, &iter, &run_id);
+    run_fib(&core, &tx, &iter, &epoch, &run_id);
 
     // graceful shutdown on SIGTERM/SIGINT would send sh packet here
     logger.join().unwrap();
 }
 
-fn run_fib(core: &str, tx: &Sender<Packet>, iter: &AtomicU64, run_id: &str) {
+fn run_fib(
+    core: &str,
+    tx: &Sender<Packet>,
+    iter_counter: &AtomicU64,
+    epoch_counter: &AtomicU64,
+    run_id: &str,
+) {
     let checkpoints = reference::checkpoints();
-    let mut a: u128 = 0;
-    let mut b: u128 = 1;
-    let mut n = 0u64;
+    let mut state = FibState::new();
     let mut cp_idx = 0;
 
-    loop {
-        let c = a.wrapping_add(b);
-        a = b;
-        b = c;
-        n += 1;
-        iter.store(n, Ordering::Relaxed);
+    // Optional fault injection for testing (set RADBENCH_FAULT_RATE to enable)
+    let mut fault_injector = std::env::var("RADBENCH_FAULT_RATE")
+        .ok()
+        .and_then(|rate_str| {
+            let rate: f64 = rate_str.parse().ok()?;
+            if rate <= 0.0 {
+                return None;
+            }
+            let seed: u64 = std::env::var("RADBENCH_FAULT_SEED")
+                .unwrap_or_else(|_| "42".into())
+                .parse()
+                .unwrap_or(42);
+            let mode = match std::env::var("RADBENCH_FAULT_MODE")
+                .unwrap_or_else(|_| "see".into())
+                .as_str()
+            {
+                "tid" => {
+                    let accel: f64 = std::env::var("RADBENCH_FAULT_ACCEL")
+                        .unwrap_or_else(|_| "1.5".into())
+                        .parse()
+                        .unwrap_or(1.5);
+                    FaultMode::Tid {
+                        initial_rate: rate,
+                        acceleration: accel,
+                    }
+                }
+                _ => FaultMode::See { rate },
+            };
+            eprintln!("[dut] fault injection enabled: {:?}", mode);
+            Some(FaultInjector::new(seed, mode))
+        });
 
-        if cp_idx < checkpoints.len() && n == checkpoints[cp_idx].n {
+    loop {
+        state.step();
+        iter_counter.store(state.n, Ordering::Relaxed);
+
+        // bit flips, disgusting code
+        if let Some(ref mut fi) = fault_injector {
+            if let Some(fault) = fi.maybe_fault() {
+                match fault.target {
+                    FaultTarget::FibA => state.flip_bit_a(fault.bit),
+                    FaultTarget::FibB => state.flip_bit_b(fault.bit),
+                }
+            }
+        }
+
+        // core workload.rs loop
+        if cp_idx < checkpoints.len() && state.n == checkpoints[cp_idx].n {
             let start = Instant::now();
-            let exact = reference::fib(n);
-            let mut h = Sha256::new();
-            h.update(exact.to_bytes_be());
-            let computed = hex::encode(h.finalize());
-            let expected = checkpoints[cp_idx].expected_hash;
-            let status = if computed == expected {
+            let result = state.check(&checkpoints[cp_idx]);
+            let elapsed = start.elapsed().as_micros() as u64;
+
+            let status = if result.passed {
                 Status::Ok
             } else {
                 Status::Mismatch
             };
-            let elapsed = start.elapsed().as_micros() as u64;
 
             tx.send(Packet {
                 seq: 0,
@@ -234,8 +280,9 @@ fn run_fib(core: &str, tx: &Sender<Packet>, iter: &AtomicU64, run_id: &str) {
                 event: Event::Checkpoint {
                     core: core.to_string(),
                     test: "fib".into(),
-                    n,
-                    hash: computed.clone(),
+                    epoch: state.epoch,
+                    n: state.n,
+                    hash: result.hash.clone(),
                     status,
                     temp_milli: read_temp(),
                     elapsed_us: elapsed,
@@ -243,7 +290,7 @@ fn run_fib(core: &str, tx: &Sender<Packet>, iter: &AtomicU64, run_id: &str) {
             })
             .unwrap();
 
-            if status == Status::Mismatch {
+            if !result.passed {
                 tx.send(Packet {
                     seq: 0,
                     ts: now_ms(),
@@ -252,9 +299,10 @@ fn run_fib(core: &str, tx: &Sender<Packet>, iter: &AtomicU64, run_id: &str) {
                     event: Event::Error {
                         core: core.to_string(),
                         test: "fib".into(),
-                        n,
-                        computed: Some(computed),
-                        expected: Some(expected.to_string()),
+                        epoch: state.epoch,
+                        n: state.n,
+                        computed: Some(result.hash),
+                        expected: Some(result.expected.to_string()),
                         reason: "checkpoint hash mismatch".into(),
                     },
                 })
@@ -263,6 +311,12 @@ fn run_fib(core: &str, tx: &Sender<Packet>, iter: &AtomicU64, run_id: &str) {
 
             cp_idx += 1;
             if cp_idx >= checkpoints.len() {
+                // Epoch complete — reset for next cycle
+                if let Some(ref mut fi) = fault_injector {
+                    fi.on_epoch_end();
+                }
+                state.reset_epoch();
+                epoch_counter.store(state.epoch, Ordering::Relaxed);
                 cp_idx = 0;
             }
         }

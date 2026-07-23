@@ -1,4 +1,3 @@
-// src/bin/monitor.rs
 use radbench::protocol::{Event, Packet, Status};
 use radbench::reference;
 use std::collections::{HashMap, HashSet};
@@ -13,22 +12,26 @@ fn main() {
     let listen = std::env::var("MONITOR_LISTEN").unwrap_or_else(|_| "0.0.0.0:9000".into());
     let serial = std::env::var("MONITOR_SERIAL").ok();
 
-    println!("monitor self-test: recomputing reference hashes...");
-    let reference = reference::checkpoints();
-    for cp in reference {
-        let recomputed = reference::hash_fib(cp.n);
+    println!("monitor self-test: verifying reference hashes...");
+    let checkpoints = reference::checkpoints();
+    for cp in checkpoints {
+        let (a, b) = reference::fib_u128_at(cp.n);
+        let recomputed = reference::hash_state(a, b);
         assert_eq!(
             recomputed, cp.expected_hash,
             "monitor self-test failed at n={}",
             cp.n
         );
     }
-    println!("monitor self-test passed ({} checkpoints)", reference.len());
+    println!(
+        "monitor self-test passed ({} checkpoints)",
+        checkpoints.len()
+    );
 
     let (tx, rx) = channel::<Packet>();
     let tx_tcp = tx.clone();
 
-    // RJ45 listener
+    // TCP
     thread::spawn(move || {
         let listener = TcpListener::bind(&listen).unwrap();
         println!("listening on {}", listen);
@@ -40,7 +43,7 @@ fn main() {
         }
     });
 
-    // UART listener
+    // UART
     if let Some(path) = serial {
         let tx_serial = tx.clone();
         thread::spawn(move || {
@@ -59,7 +62,6 @@ fn main() {
         });
     }
 
-    // Dedup key includes run_id so restarts with seq=1 don't collide
     let mut seen = HashSet::new();
     let mut last_heartbeat: HashMap<String, u64> = HashMap::new();
     let mut alarm = OpenOptions::new()
@@ -88,29 +90,41 @@ fn main() {
             Event::Checkpoint {
                 core,
                 test,
+                epoch,
                 n,
                 hash,
                 status,
+                elapsed_us,
                 ..
             } => {
-                let expected = reference
+                let expected = checkpoints
                     .iter()
                     .find(|c| c.n == *n)
                     .map(|c| c.expected_hash);
                 let ok = expected.map(|e| e == hash.as_str()).unwrap_or(false);
-                if !ok || *status == Status::Mismatch {
+                if ok && *status == Status::Ok {
+                    eprintln!(
+                        "checkpoint{} {} epoch={} n={} OK ({}µs)",
+                        run_tag, core, epoch, n, elapsed_us
+                    );
+                } else {
                     let msg = format!(
-                        "ALARM ts={}{} core={} test={} n={} expected={:?} got={}",
-                        pkt.ts, run_tag, core, test, n, expected, hash
+                        "ALARM ts={}{} core={} test={} epoch={} n={} expected={:?} got={}",
+                        pkt.ts, run_tag, core, test, epoch, n, expected, hash
                     );
                     eprintln!("{}", msg);
                     writeln!(alarm, "{}", msg).unwrap();
                     alarm.flush().unwrap();
                 }
             }
-            Event::Heartbeat { core, iter, .. } => {
+            Event::Heartbeat {
+                core, epoch, iter, ..
+            } => {
                 last_heartbeat.insert(core.clone(), pkt.ts);
-                eprintln!("heartbeat{} {} iter={}", run_tag, core, iter);
+                eprintln!(
+                    "heartbeat{} {} epoch={} iter={}",
+                    run_tag, core, epoch, iter
+                );
             }
             Event::Error { .. } => {
                 let msg = format!("ALARM ts={}{} DUT-ERROR {:?}", pkt.ts, run_tag, pkt);
@@ -137,6 +151,11 @@ fn main() {
 }
 
 fn handle_stream(stream: TcpStream, tx: Sender<Packet>) {
+    let peer = stream
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "unknown".into());
+    eprintln!("[monitor] DUT connected from {}", peer);
     let reader = BufReader::new(stream);
     for line in reader.lines() {
         if let Ok(l) = line {
@@ -145,4 +164,5 @@ fn handle_stream(stream: TcpStream, tx: Sender<Packet>) {
             }
         }
     }
+    eprintln!("[monitor] DUT disconnected: {}", peer);
 }

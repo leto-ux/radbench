@@ -17,6 +17,7 @@ pub enum Event {
     Checkpoint {
         core: String,
         test: String,
+        epoch: u64,
         n: u64,
         hash: String,
         status: Status,
@@ -26,6 +27,7 @@ pub enum Event {
     #[serde(rename = "heartbeat")]
     Heartbeat {
         core: String,
+        epoch: u64,
         iter: u64,
         temp_milli: Option<i32>,
     },
@@ -33,6 +35,7 @@ pub enum Event {
     Error {
         core: String,
         test: String,
+        epoch: u64,
         n: u64,
         computed: Option<String>,
         expected: Option<String>,
