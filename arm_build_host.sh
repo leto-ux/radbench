@@ -1,14 +1,10 @@
 #!/bin/sh
 
-docker run --rm \
-  -e LOCAL_UID=$(id -u) \
-  -e LOCAL_GID=$(id -g) \
-  -v $PWD:/app \
-  ejortega/milkv-duo-rust:2.0 \
-  cargo build --bin dut --target aarch64gc-unknown-linux-musl --release
+# cargo build --bin dut --target aarch64-unknown-linux-gnu --release
+RUSTFLAGS="-C target-feature=+crt-static" cargo build --bin dut --target aarch64-unknown-linux-gnu --release
 
 cargo build --bin monitor --target x86_64-unknown-linux-gnu --release
 
-scp -O ./target/aarch64gc-unknown-linux-musl/release/dut ./arm_build_host.sh root@milkv_arm:/root/
+scp -O ./target/aarch64-unknown-linux-gnu/release/dut ./arm_run_dut.sh root@milkv_arm:/root/
 
 ./target/x86_64-unknown-linux-gnu/release/monitor

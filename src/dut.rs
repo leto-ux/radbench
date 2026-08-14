@@ -4,13 +4,20 @@ use radbench::reference;
 use radbench::workload::FibState;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::net::TcpStream;
+use std::net::{TcpStream, UdpSocket};
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Sender, channel};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+// Global flag: SIGUSR1 or UDP "flip" sets this, fib loop consumes it
+static INJECT_PENDING: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn handle_sigusr1(_sig: libc::c_int) {
+    INJECT_PENDING.store(true, Ordering::SeqCst);
+}
 
 fn main() {
     let core = std::env::var("RADBENCH_CORE").unwrap_or_else(|_| "core0".into());
@@ -197,6 +204,46 @@ fn main() {
         }
     });
 
+    // Register SIGUSR1 → inject a single fault
+    unsafe {
+        libc::signal(libc::SIGUSR1, handle_sigusr1 as libc::sighandler_t);
+    }
+    eprintln!("[dut] SIGUSR1 registered for fault injection");
+
+    // UDP control channel (default port 9001, separate from TCP monitor)
+    let control_addr = std::env::var("RADBENCH_CONTROL")
+        .unwrap_or_else(|_| "0.0.0.0:9001".into());
+    match UdpSocket::bind(&control_addr) {
+        Ok(sock) => {
+            eprintln!("[dut] control channel on udp://{}", control_addr);
+            thread::spawn(move || {
+                let mut buf = [0u8; 256];
+                loop {
+                    if let Ok((len, src)) = sock.recv_from(&mut buf) {
+                        let cmd = std::str::from_utf8(&buf[..len])
+                            .unwrap_or("")
+                            .trim();
+                        match cmd {
+                            "flip" => {
+                                INJECT_PENDING.store(true, Ordering::SeqCst);
+                                eprintln!("[control] fault requested from {}", src);
+                            }
+                            "status" => {
+                                let _ = sock.send_to(b"ok\n", src);
+                            }
+                            other => {
+                                eprintln!("[control] unknown command from {}: {:?}", src, other);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        Err(e) => {
+            eprintln!("[dut] control channel bind failed: {} (continuing without)", e);
+        }
+    }
+
     run_fib(&core, &tx, &iter, &epoch, &run_id);
 
     // graceful shutdown on SIGTERM/SIGINT would send sh packet here
@@ -250,7 +297,36 @@ fn run_fib(
         state.step();
         iter_counter.store(state.n, Ordering::Relaxed);
 
-        // bit flips, disgusting code
+        // On-demand fault injection (SIGUSR1 or UDP "flip")
+        if INJECT_PENDING
+            .compare_exchange(true, false, Ordering::SeqCst, Ordering::Relaxed)
+            .is_ok()
+        {
+            let bit = (state.n % 128) as u8;
+            state.flip_bit_a(bit);
+            eprintln!(
+                "[dut] synthetic fault injected: a bit {} at iter {} epoch {}",
+                bit, state.n, state.epoch
+            );
+            tx.send(Packet {
+                seq: 0,
+                ts: now_ms(),
+                source: format!("dut-{}", core),
+                run_id: Some(run_id.to_string()),
+                event: Event::Error {
+                    core: core.to_string(),
+                    test: "fib".into(),
+                    epoch: state.epoch,
+                    n: state.n,
+                    computed: None,
+                    expected: None,
+                    reason: format!("synthetic_fault: flipped a[{}]", bit),
+                },
+            })
+            .unwrap();
+        }
+
+        // Continuous fault injection (env-var configured, for automated testing)
         if let Some(ref mut fi) = fault_injector {
             if let Some(fault) = fi.maybe_fault() {
                 match fault.target {
