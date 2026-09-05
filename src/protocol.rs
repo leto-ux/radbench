@@ -53,6 +53,12 @@ pub enum Event {
         reason: String,
         final_iter: u64,
     },
+    #[serde(rename = "announce")]
+    Announce {
+        core: String,
+        arch: String,
+        uname: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

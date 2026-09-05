@@ -6,6 +6,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::{TcpStream, UdpSocket};
 use std::os::unix::io::AsRawFd;
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Sender, channel};
@@ -154,6 +155,22 @@ fn main() {
             }
         })
     };
+
+    // Announce architecture to monitor
+    let arch = detect_arch();
+    let uname_full = detect_uname();
+    eprintln!("[dut] architecture: {} ({})", arch, uname_full);
+    let _ = tx.send(Packet {
+        seq: 0,
+        ts: now_ms(),
+        source: format!("dut-{}", core),
+        run_id: Some(run_id.clone()),
+        event: Event::Announce {
+            core: core.clone(),
+            arch: arch.clone(),
+            uname: uname_full,
+        },
+    });
 
     // heartbeat
     let tx_hb = tx.clone();
@@ -446,4 +463,20 @@ fn crc32_file(path: &str) -> u32 {
         }
     }
     crc ^ 0xFFFFFFFF
+}
+
+fn detect_arch() -> String {
+    Command::new("uname")
+        .arg("-m")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|_| "unknown".into())
+}
+
+fn detect_uname() -> String {
+    Command::new("uname")
+        .arg("-a")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|_| "unknown".into())
 }
