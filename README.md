@@ -19,16 +19,22 @@ sudo firewall-cmd --zone=trusted --change-interface=enp56s0f4u1
 
 ## Faults
 
-SEE mode: ~0.1% chance of a flip per step
+The fault rate is a **per-step** probability. One epoch is 10 million steps
+(last checkpoint at n=10M), so `expected faults/epoch ≈ rate × 10,000,000`.
+
+SEE mode: constant random bit-flips (~1 fault every 2 epochs on average)
 ```sh
-RADBENCH_FAULT_RATE=0.001 ./radbench
+RADBENCH_FAULT_RATE=5e-8 ./radbench
  ```
 
-TID mode: starts at 0.05%, accelerates 2× per epoch
-
+TID mode: starts near-silent, doubles each epoch (first faults around epoch 5–7)
 ```sh
-RADBENCH_FAULT_RATE=0.0005 RADBENCH_FAULT_MODE=tid RADBENCH_FAULT_ACCEL=2.0 ./radbench
+RADBENCH_FAULT_RATE=5e-9 RADBENCH_FAULT_MODE=tid RADBENCH_FAULT_ACCEL=2.0 ./radbench
 ```
+
+> **Choosing a rate:** `rate × 10,000,000` = expected faults in epoch 0.
+> For TID, epoch *k* multiplies by `accel^k`, so faults grow as
+> `rate × 10M × accel^k`.
 
 Bit flips
 
