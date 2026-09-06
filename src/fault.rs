@@ -14,6 +14,15 @@ fn xorshift64(state: &mut u64) -> u64 {
     x
 }
 
+/// SplitMix64 generator used to thoroughly scramble initial seeds into 64-bit state space.
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9e3779b97f4a7c15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+    z ^ (z >> 31)
+}
+
 pub struct FaultInjector {
     rng: u64,
     mode: FaultMode,
@@ -46,8 +55,16 @@ pub enum FaultTarget {
 
 impl FaultInjector {
     pub fn new(seed: u64, mode: FaultMode) -> Self {
+        let mut sm = seed.max(1);
+        let mut rng = splitmix64(&mut sm);
+        if rng == 0 {
+            rng = 1;
+        }
+        for _ in 0..64 {
+            xorshift64(&mut rng);
+        }
         Self {
-            rng: seed.max(1), // xorshift can't be seeded with 0
+            rng,
             mode,
             epoch_multiplier: 1.0,
             total_injected: 0,

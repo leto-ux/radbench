@@ -391,3 +391,15 @@ fn tid_simulation_increasing_failure_rate() {
         late_failures
     );
 }
+
+#[test]
+fn test_fault_injector_seed_warmup_no_step1_fault() {
+    // With small seeds like 42 and rate = 5e-9, un-warmed xorshift64 had a cold-start
+    // anomaly where step 1 generated p = 2.46e-9 < 5e-9, causing an immediate fault on step 1.
+    // Ensure that with splitmix64 + warmup, step 1 does not deterministically fault.
+    let mut fi = FaultInjector::new(42, FaultMode::See { rate: 5e-9 });
+    assert!(
+        fi.maybe_fault().is_none(),
+        "Step 1 should not fault under rate 5e-9"
+    );
+}
