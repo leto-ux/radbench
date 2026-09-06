@@ -47,15 +47,21 @@ def parse_log(path: Path, run_id: str):
     Parse a single DUT log file and return structured data for plotting.
 
     Returns a dict with:
-        source:    str            — DUT source name (e.g. "dut-arm")
-        arch:      str            — architecture (e.g. "aarch64")
-        failures:  list of dict   — each failure event with ts, epoch, n, reason
-        checkpoints: list of dict — every checkpoint (for timeline context)
+        source:      str            — DUT source name (e.g. "dut-arm")
+        arch:        str            — architecture (e.g. "aarch64")
+        failures:    list of dict   — each failure event with ts, epoch, n, reason
+        checkpoints: list of dict   — every checkpoint (for timeline context)
+        gaps:        list of dict   — sequence number gaps indicating monitor disconnection
+        all_ts:      list of int    — all observed packet timestamps
     """
     source = None
     arch = "unknown"
     failures = []
     checkpoints = []
+    gaps = []
+    all_ts = []
+    prev_seq = None
+    prev_ts = None
 
     with open(path) as f:
         for lineno, raw in enumerate(f, 1):
@@ -70,6 +76,26 @@ def parse_log(path: Path, run_id: str):
             # Only consider packets belonging to this run
             if pkt.get("run_id") != run_id:
                 continue
+
+            seq = pkt.get("seq")
+            ts = pkt.get("ts")
+
+            if ts is not None:
+                all_ts.append(ts)
+
+            # Check for sequence number gap indicating monitor disconnection / missed data
+            if seq is not None and seq > 0:
+                if prev_seq is not None and seq > prev_seq + 1:
+                    gaps.append({
+                        "start_ts": prev_ts,
+                        "end_ts": ts,
+                        "start_seq": prev_seq,
+                        "end_seq": seq,
+                        "dropped_packets": seq - prev_seq - 1,
+                        "duration_s": (ts - prev_ts) / 1000.0 if (prev_ts and ts) else 0.0,
+                    })
+                prev_seq = seq
+                prev_ts = ts
 
             ev = pkt.get("event", {})
             ev_type = ev.get("type")
@@ -110,26 +136,60 @@ def parse_log(path: Path, run_id: str):
         "arch": arch,
         "failures": failures,
         "checkpoints": checkpoints,
+        "gaps": gaps,
+        "all_ts": all_ts,
     }
 
 
 # ── Plotting ─────────────────────────────────────────────────────────────────
 
 def _t0_for(d: dict) -> int:
-    """Earliest timestamp in a DUT dataset (from checkpoints or failures)."""
+    """Earliest timestamp in a DUT dataset."""
+    candidates = d.get("all_ts", [])
+    if candidates:
+        return min(candidates)
     candidates = [cp["ts"] for cp in d["checkpoints"]]
     candidates += [f["ts"] for f in d["failures"]]
     return min(candidates) if candidates else 0
 
 
+def mark_disconnections(ax, dut_data: list[dict], label_needed: bool = True):
+    """
+    Draw transparent red vertical bars across the plot for periods
+    during which the monitor was disconnected (identified by sequence number gaps).
+    """
+    legend_added = False
+    for d in dut_data:
+        gaps = d.get("gaps", [])
+        if not gaps:
+            continue
+        t0 = _t0_for(d)
+        for g in gaps:
+            t_start = (g["start_ts"] - t0) / 1000.0
+            t_end = (g["end_ts"] - t0) / 1000.0
+
+            lbl = "Monitor disconnected" if (label_needed and not legend_added) else None
+            if lbl:
+                legend_added = True
+
+            # Transparent red bar covering the disconnection interval
+            if t_end - t_start < 0.05:
+                # For instantaneous/sub-second drops, draw a visible red line
+                ax.axvline(t_start, color="red", alpha=0.5, linewidth=2.0, label=lbl, zorder=1)
+            else:
+                ax.axvspan(t_start, t_end, color="red", alpha=0.22, label=lbl, zorder=1)
+                ax.axvline(t_start, color="red", linestyle="--", linewidth=0.8, alpha=0.4, zorder=2)
+                ax.axvline(t_end, color="red", linestyle="--", linewidth=0.8, alpha=0.4, zorder=2)
+
+
 def plot_failures(run_id: str, dut_data: list[dict], output: Path):
     """
     Create a multi-panel figure:
-      1. Cumulative failures over time  (linear + log₁₀ twin axis)
+      1. Cumulative failures over time  (linear + log₁₀ twin axis) [time x-axis: red gap bars]
       2. Checkpoint pass rate per epoch  (degradation curve)
-      3. Inter-failure interval / MTBF   (time between consecutive failures)
+      3. Inter-failure interval / MTBF   (time between consecutive failures) [time x-axis: red gap bars]
       4. Failures per epoch              (bar chart)
-      5. Temperature over time           (with failure-event markers)
+      5. Temperature over time           (with failure-event markers) [time x-axis: red gap bars]
     """
     has_temp = any(
         cp.get("temp_milli") is not None
@@ -143,9 +203,12 @@ def plot_failures(run_id: str, dut_data: list[dict], output: Path):
 
     colors = plt.cm.tab10.colors
 
-    # ── Panel 1: cumulative failures (linear + log₁₀) ────────────────────
+    # ── Panel 1: cumulative failures (linear + log₁₀) [Time X-Axis] ──────
     ax_cum = axes[0]
     ax_log = ax_cum.twinx()
+
+    # Mark disconnected periods as transparent red bars
+    mark_disconnections(ax_cum, dut_data, label_needed=True)
 
     for i, d in enumerate(dut_data):
         if not d["failures"]:
@@ -160,13 +223,13 @@ def plot_failures(run_id: str, dut_data: list[dict], output: Path):
 
         # Linear (left axis)
         ax_cum.step(times_s, cumulative, where="post", label=label,
-                    color=c, linewidth=1.5)
+                    color=c, linewidth=1.5, zorder=3)
         ax_cum.scatter(times_s, cumulative, s=18, zorder=5,
                        color=c, edgecolors="black", linewidths=0.4)
 
         # Log₁₀ (right axis, dashed)
         ax_log.plot(times_s, log_cum, color=c, linewidth=1.2,
-                    linestyle="--", alpha=0.7, label=f"log\u2081\u2080 {label}")
+                    linestyle="--", alpha=0.7, label=f"log\u2081\u2080 {label}", zorder=3)
 
     ax_cum.set_ylabel("Cumulative failures (linear)")
     ax_log.set_ylabel("log\u2081\u2080(cumulative failures)")
@@ -175,7 +238,7 @@ def plot_failures(run_id: str, dut_data: list[dict], output: Path):
     ax_cum.yaxis.set_major_locator(ticker.MaxNLocator(integer=True))
     ax_cum.grid(True, alpha=0.3)
 
-    # Merge legends from both axes
+    # Merge legends from both axes (including red gap bar legend)
     h1, l1 = ax_cum.get_legend_handles_labels()
     h2, l2 = ax_log.get_legend_handles_labels()
     ax_cum.legend(h1 + h2, l1 + l2, loc="upper left", fontsize=8)
@@ -211,8 +274,11 @@ def plot_failures(run_id: str, dut_data: list[dict], output: Path):
     ax_pass.legend(loc="lower left", fontsize=9)
     ax_pass.grid(True, alpha=0.3)
 
-    # ── Panel 3: inter-failure interval (MTBF evolution) ─────────────────
+    # ── Panel 3: inter-failure interval (MTBF evolution) [Time X-Axis] ────
     ax_mtbf = axes[2]
+    # Mark disconnected periods as transparent red bars
+    mark_disconnections(ax_mtbf, dut_data, label_needed=True)
+
     for i, d in enumerate(dut_data):
         if len(d["failures"]) < 2:
             continue
@@ -228,7 +294,7 @@ def plot_failures(run_id: str, dut_data: list[dict], output: Path):
         ax_mtbf.scatter(midpoints, intervals, s=20, color=c,
                         edgecolors="black", linewidths=0.4, label=label,
                         zorder=5)
-        ax_mtbf.plot(midpoints, intervals, color=c, linewidth=0.8, alpha=0.5)
+        ax_mtbf.plot(midpoints, intervals, color=c, linewidth=0.8, alpha=0.5, zorder=4)
 
     ax_mtbf.set_ylabel("\u0394t between failures (s)")
     ax_mtbf.set_xlabel("Time since start (s)")
@@ -262,9 +328,12 @@ def plot_failures(run_id: str, dut_data: list[dict], output: Path):
     ax_epoch.grid(True, axis="y", alpha=0.3)
     ax_epoch.yaxis.set_major_locator(ticker.MaxNLocator(integer=True))
 
-    # ── Panel 5 (optional): temperature with failure markers ─────────────
+    # ── Panel 5 (optional): temperature with failure markers [Time X-Axis] ─
     if has_temp:
         ax_temp = axes[4]
+        # Mark disconnected periods as transparent red bars
+        mark_disconnections(ax_temp, dut_data, label_needed=True)
+
         for i, d in enumerate(dut_data):
             temps = [(cp["ts"], cp["temp_milli"])
                      for cp in d["checkpoints"]
@@ -278,12 +347,12 @@ def plot_failures(run_id: str, dut_data: list[dict], output: Path):
             label = f'{d["source"]} ({d["arch"]})'
             c = colors[i % len(colors)]
             ax_temp.plot(t_s, t_c, label=label, color=c,
-                         linewidth=1, alpha=0.7)
+                         linewidth=1, alpha=0.7, zorder=3)
 
             # Overlay failure timestamps as vertical markers
             fail_ts = [(f["ts"] - t0) / 1000.0 for f in d["failures"]]
             for ft in fail_ts:
-                ax_temp.axvline(ft, color=c, linewidth=0.5, alpha=0.25)
+                ax_temp.axvline(ft, color=c, linewidth=0.5, alpha=0.25, zorder=2)
 
         ax_temp.set_ylabel("Temperature (\u00b0C)")
         ax_temp.set_xlabel("Time since start (s)")
@@ -314,14 +383,17 @@ def print_summary(run_id: str, dut_data: list[dict]):
 
         # Compute run duration and MTBF
         t0 = _t0_for(d)
-        all_ts = ([cp["ts"] for cp in d["checkpoints"]]
-                  + [f["ts"] for f in d["failures"]])
+        all_ts = d.get("all_ts", [])
+        if not all_ts:
+            all_ts = [cp["ts"] for cp in d["checkpoints"]] + [f["ts"] for f in d["failures"]]
         duration_s = (max(all_ts) - t0) / 1000.0 if all_ts else 0
         n_fail_total = n_err + n_mis
         mtbf_s = duration_s / n_fail_total if n_fail_total > 0 else float("inf")
 
         # Cross-section: fraction of epochs that had at least one failure
         cross_section = len(fail_epochs) / len(epochs) if epochs else 0
+
+        gaps = d.get("gaps", [])
 
         print(f"\n  DUT: {d['source']}  arch: {d['arch']}")
         print(f"    Run duration      : {duration_s:.1f} s")
@@ -337,6 +409,18 @@ def print_summary(run_id: str, dut_data: list[dict]):
             print(f"    MTBF              : {mtbf_s:.1f} s")
         else:
             print(f"    MTBF              : \u221e (no failures)")
+
+        if gaps:
+            total_dropped = sum(g["dropped_packets"] for g in gaps)
+            total_gap_s = sum(g["duration_s"] for g in gaps)
+            print(f"    Disconnections    : {len(gaps)} gap(s), {total_dropped} pkts dropped, ~{total_gap_s:.1f}s disconnected")
+            for gi, g in enumerate(gaps, 1):
+                t_start = (g["start_ts"] - t0) / 1000.0
+                t_end = (g["end_ts"] - t0) / 1000.0
+                print(f"      [{gi}] t={t_start:.1f}s \u2192 {t_end:.1f}s (dt={g['duration_s']:.2f}s, seq {g['start_seq']}\u2192{g['end_seq']}, {g['dropped_packets']} pkts)")
+        else:
+            print("    Disconnections    : 0 (connection continuous)")
+
     print()
 
 
