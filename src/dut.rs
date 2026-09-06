@@ -4,7 +4,7 @@ use radbench::reference;
 use radbench::workload::FibState;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::net::{TcpStream, UdpSocket};
+use std::net::{TcpStream, ToSocketAddrs, UdpSocket};
 use std::os::unix::io::AsRawFd;
 use std::process::Command;
 use std::sync::Arc;
@@ -34,6 +34,10 @@ fn main() {
     // Unique run_id so the monitor can distinguish restarts
     let run_id = format!("{:08x}", now_ms() & 0xFFFFFFFF);
 
+    let arch = detect_arch();
+    let uname_full = detect_uname();
+    eprintln!("[dut] architecture: {} ({})", arch, uname_full);
+
     core_affinity::set_for_current(core_affinity::CoreId { id: cpu });
 
     let (tx, rx) = channel::<Packet>();
@@ -45,6 +49,9 @@ fn main() {
     // Logger thread: local file + optional UART + reconnecting TCP
     let logger = {
         let core = core.clone();
+        let arch = arch.clone();
+        let uname_full = uname_full.clone();
+        let run_id = run_id.clone();
         let log_path = log_path.clone();
         let monitor_addr = monitor_addr.clone();
         thread::spawn(move || {
@@ -99,9 +106,38 @@ fn main() {
                 // TCP — reconnect if disconnected
                 if tcp.is_none() && tcp_last_attempt.elapsed() >= tcp_backoff {
                     tcp_last_attempt = Instant::now();
-                    match TcpStream::connect(&monitor_addr) {
-                        Ok(s) => {
+                    let connect_res = if let Ok(mut addrs) = monitor_addr.to_socket_addrs() {
+                        if let Some(addr) = addrs.next() {
+                            TcpStream::connect_timeout(&addr, Duration::from_secs(3))
+                        } else {
+                            TcpStream::connect(&monitor_addr)
+                        }
+                    } else {
+                        TcpStream::connect(&monitor_addr)
+                    };
+
+                    match connect_res {
+                        Ok(mut s) => {
+                            let _ = s.set_write_timeout(Some(Duration::from_secs(3)));
+                            let _ = s.set_read_timeout(Some(Duration::from_secs(3)));
                             eprintln!("[logger] TCP connected to {}", monitor_addr);
+
+                            // Send announce packet on connection/reconnection
+                            let announce = Packet {
+                                seq: 0,
+                                ts: now_ms(),
+                                source: format!("dut-{}", core),
+                                run_id: Some(run_id.clone()),
+                                event: Event::Announce {
+                                    core: core.clone(),
+                                    arch: arch.clone(),
+                                    uname: uname_full.clone(),
+                                },
+                            };
+                            if let Ok(ann_line) = serde_json::to_string(&announce) {
+                                let _ = writeln!(s, "{}", ann_line);
+                            }
+
                             tcp = Some(s);
                             tcp_backoff = Duration::from_secs(1);
                         }
@@ -118,6 +154,7 @@ fn main() {
                     if writeln!(t, "{}", line).is_err() {
                         eprintln!("[logger] TCP write failed, will reconnect");
                         tcp = None;
+                        tcp_last_attempt = Instant::now();
                     }
                 }
 
@@ -149,6 +186,7 @@ fn main() {
                         if writeln!(t, "{}", line).is_err() {
                             eprintln!("[logger] TCP write failed, will reconnect");
                             tcp = None;
+                            tcp_last_attempt = Instant::now();
                         }
                     }
                 }
@@ -156,10 +194,7 @@ fn main() {
         })
     };
 
-    // Announce architecture to monitor
-    let arch = detect_arch();
-    let uname_full = detect_uname();
-    eprintln!("[dut] architecture: {} ({})", arch, uname_full);
+    // Send initial announce packet so local log & UART also record it
     let _ = tx.send(Packet {
         seq: 0,
         ts: now_ms(),

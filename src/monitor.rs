@@ -113,13 +113,16 @@ fn main() {
         let pkt = tagged.pkt;
         let peer = tagged.peer;
 
-        let dedup_key = (
-            pkt.source.clone(),
-            pkt.run_id.clone().unwrap_or_default(),
-            pkt.seq,
-        );
-        if !seen.insert(dedup_key) {
-            continue;
+        // Only deduplicate packets with non-zero sequence numbers so re-announce packets on reconnect are processed
+        if pkt.seq != 0 {
+            let dedup_key = (
+                pkt.source.clone(),
+                pkt.run_id.clone().unwrap_or_default(),
+                pkt.seq,
+            );
+            if !seen.insert(dedup_key) {
+                continue;
+            }
         }
 
         let run_tag = pkt
@@ -134,31 +137,6 @@ fn main() {
                     "[monitor] DUT announced: core={} arch={} peer={} uname={}",
                     core, arch, peer, uname
                 );
-
-                // Create a per-DUT log file: logs/<timestamp>_<arch>_<core>.log
-                let dut_log_path = format!(
-                    "{}/{}_{}_{}_{}.log",
-                    log_dir, session_ts, arch, core,
-                    pkt.run_id.as_deref().unwrap_or("unknown")
-                );
-                let dut_log = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&dut_log_path)
-                    .unwrap();
-                eprintln!("[monitor] logging {} ({}) -> {}", core, arch, dut_log_path);
-
-                // Write the announce packet to the DUT's log
-                let line = serde_json::to_string(&pkt).unwrap();
-                let mut state = DutState {
-                    arch: arch.clone(),
-                    log_file: dut_log,
-                    _log_path: dut_log_path,
-                };
-                let _ = writeln!(state.log_file, "{}", line);
-                let _ = state.log_file.flush();
-
-                dut_states.insert(pkt.source.clone(), state);
             }
             Event::Checkpoint {
                 core,
@@ -195,9 +173,6 @@ fn main() {
                     writeln!(alarm, "{}", msg).unwrap();
                     alarm.flush().unwrap();
                 }
-
-                // Write to per-DUT log
-                log_to_dut(&mut dut_states, &pkt);
             }
             Event::Heartbeat {
                 core, epoch, iter, ..
@@ -212,8 +187,6 @@ fn main() {
                     "heartbeat{} {}{} epoch={} iter={}",
                     run_tag, core, arch_tag, epoch, iter
                 );
-
-                log_to_dut(&mut dut_states, &pkt);
             }
             Event::Error { .. } => {
                 let arch_tag = dut_states
@@ -228,8 +201,6 @@ fn main() {
                 eprintln!("{}", msg);
                 writeln!(alarm, "{}", msg).unwrap();
                 alarm.flush().unwrap();
-
-                log_to_dut(&mut dut_states, &pkt);
             }
             Event::Shutdown {
                 core,
@@ -248,23 +219,109 @@ fn main() {
                 eprintln!("{}", msg);
                 writeln!(alarm, "{}", msg).unwrap();
                 alarm.flush().unwrap();
-
-                log_to_dut(&mut dut_states, &pkt);
             }
-            _ => {
-                log_to_dut(&mut dut_states, &pkt);
-            }
+            _ => {}
         }
+
+        // Always write every packet to the per-DUT log file (resumes or creates log file)
+        log_to_dut(&mut dut_states, &log_dir, &session_ts, &pkt);
     }
 }
 
-/// Write a packet to the per-DUT log file (if the DUT has announced itself).
-fn log_to_dut(dut_states: &mut HashMap<String, DutState>, pkt: &Packet) {
-    if let Some(state) = dut_states.get_mut(&pkt.source) {
-        let line = serde_json::to_string(pkt).unwrap();
-        let _ = writeln!(state.log_file, "{}", line);
-        let _ = state.log_file.flush();
+fn ensure_dut_state<'a>(
+    dut_states: &'a mut HashMap<String, DutState>,
+    log_dir: &str,
+    session_ts: &str,
+    pkt: &Packet,
+    arch_hint: Option<&str>,
+    core_hint: Option<&str>,
+) -> &'a mut DutState {
+    if !dut_states.contains_key(&pkt.source) {
+        let run_id = pkt.run_id.as_deref().unwrap_or("unknown");
+        let core = core_hint
+            .or_else(|| pkt.source.strip_prefix("dut-"))
+            .unwrap_or("unknown");
+        let arch = arch_hint.unwrap_or("unknown");
+
+        // Check if an existing log file for this run_id exists in log_dir to resume it
+        let mut target_log_path = None;
+        if run_id != "unknown" {
+            if let Ok(entries) = fs::read_dir(log_dir) {
+                let suffix = format!("_{}.log", run_id);
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if name.ends_with(&suffix) && !name.starts_with("alarms_") {
+                        target_log_path = Some(format!("{}/{}", log_dir, name));
+                        break;
+                    }
+                }
+            }
+        }
+
+        let (log_path, resumed) = match target_log_path {
+            Some(p) => (p, true),
+            None => (
+                format!("{}/{}_{}_{}_{}.log", log_dir, session_ts, arch, core, run_id),
+                false,
+            ),
+        };
+
+        let log_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .unwrap_or_else(|e| panic!("failed to open dut log {}: {}", log_path, e));
+
+        if resumed {
+            eprintln!(
+                "[monitor] resumed logging {} ({}) -> {}",
+                core, arch, log_path
+            );
+        } else {
+            eprintln!("[monitor] logging {} ({}) -> {}", core, arch, log_path);
+        }
+
+        dut_states.insert(
+            pkt.source.clone(),
+            DutState {
+                arch: arch.to_string(),
+                log_file,
+                _log_path: log_path,
+            },
+        );
     }
+    dut_states.get_mut(&pkt.source).unwrap()
+}
+
+/// Write a packet to the per-DUT log file (resumes or creates log file if needed).
+fn log_to_dut(
+    dut_states: &mut HashMap<String, DutState>,
+    log_dir: &str,
+    session_ts: &str,
+    pkt: &Packet,
+) {
+    let core_hint = match &pkt.event {
+        Event::Checkpoint { core, .. }
+        | Event::Heartbeat { core, .. }
+        | Event::Error { core, .. }
+        | Event::Shutdown { core, .. }
+        | Event::Announce { core, .. } => Some(core.as_str()),
+        _ => None,
+    };
+    let arch_hint = match &pkt.event {
+        Event::Announce { arch, .. } => Some(arch.as_str()),
+        _ => None,
+    };
+
+    let state = ensure_dut_state(dut_states, log_dir, session_ts, pkt, arch_hint, core_hint);
+    if let Some(arch) = arch_hint {
+        if state.arch == "unknown" {
+            state.arch = arch.to_string();
+        }
+    }
+    let line = serde_json::to_string(pkt).unwrap();
+    let _ = writeln!(state.log_file, "{}", line);
+    let _ = state.log_file.flush();
 }
 
 fn handle_stream(stream: TcpStream, tx: Sender<TaggedPacket>) {
@@ -273,6 +330,7 @@ fn handle_stream(stream: TcpStream, tx: Sender<TaggedPacket>) {
         .map(|a| a.to_string())
         .unwrap_or_else(|_| "unknown".into());
     eprintln!("[monitor] DUT connected from {}", peer);
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
     let reader = BufReader::new(stream);
     for line in reader.lines() {
         if let Ok(l) = line {
