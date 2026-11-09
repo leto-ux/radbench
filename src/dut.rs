@@ -11,7 +11,7 @@ use std::net::{TcpStream, ToSocketAddrs, UdpSocket};
 use std::os::unix::io::AsRawFd;
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::mpsc::{Sender, channel};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -20,6 +20,173 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 static INJECT_PENDING: AtomicBool = AtomicBool::new(false);
 // UDP "flipreg" sets this, register workload consumes it
 static REG_INJECT_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// fd of the crash-marker file, written from fatal-signal handlers.
+static CRASH_FD: AtomicI32 = AtomicI32::new(-1);
+
+extern "C" fn handle_fatal(sig: libc::c_int) {
+    let name = radbench::kmsg::signal_name(sig);
+    let fd = CRASH_FD.load(Ordering::Relaxed);
+    // Only async-signal-safe calls here: write(2) and fsync(2).
+    unsafe {
+        if fd >= 0 {
+            libc::write(fd, name.as_ptr() as *const libc::c_void, name.len());
+            libc::fsync(fd);
+        }
+        let msg = b"[dut] fatal signal, see crash marker\n";
+        libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
+    }
+    // SA_RESETHAND restored the default action; returning re-executes the
+    // faulting instruction (or we re-raise for async signals) and the process
+    // dies normally, so the run script restarts it.
+    unsafe {
+        libc::raise(sig);
+    }
+}
+
+/// Record panics and fatal signals into `<log>.crash` so the *next* run can
+/// report why the previous one died (the dying process may not get a packet
+/// out). A panic in any thread aborts the process: a half-dead DUT (e.g. a
+/// dead heartbeat thread) is harder to interpret than a clean restart.
+fn install_crash_handlers(marker: &str) {
+    if let Ok(f) = OpenOptions::new().create(true).append(true).open(marker) {
+        CRASH_FD.store(f.as_raw_fd(), Ordering::Relaxed);
+        std::mem::forget(f);
+    }
+    let marker = marker.to_string();
+    std::panic::set_hook(Box::new(move |info| {
+        eprintln!("[dut] panic: {}", info);
+        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&marker) {
+            let _ = write!(f, "panic: {}", info);
+            let _ = f.sync_all();
+        }
+        std::process::abort();
+    }));
+    for sig in [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGFPE, libc::SIGABRT] {
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = handle_fatal as *const () as libc::sighandler_t;
+            sa.sa_flags = libc::SA_RESETHAND | libc::SA_ONSTACK;
+            libc::sigemptyset(&mut sa.sa_mask);
+            libc::sigaction(sig, &sa, std::ptr::null_mut());
+        }
+    }
+}
+
+/// Findings about how the previous run / boot ended, reported at startup as
+/// (test, reason) pairs.
+fn previous_run_report(log_path: &str) -> Vec<(String, String)> {
+    let mut out = vec![];
+
+    // Process crash marker from the previous run.
+    let marker = format!("{}.crash", log_path);
+    if let Ok(s) = std::fs::read_to_string(&marker) {
+        if !s.trim().is_empty() {
+            let when = std::fs::metadata(&marker)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_millis().to_string())
+                .unwrap_or_else(|| "?".into());
+            out.push(("crash".into(), format!("previous run died: {} (at ts={})", s.trim(), when)));
+        }
+        let _ = std::fs::write(&marker, b"");
+    }
+
+    // Board reboot detection via the kernel boot id.
+    let boot_id_path = format!("{}.bootid", log_path);
+    if let Ok(cur) = std::fs::read_to_string("/proc/sys/kernel/random/boot_id") {
+        let cur = cur.trim();
+        if let Ok(prev) = std::fs::read_to_string(&boot_id_path) {
+            if prev.trim() != cur {
+                let uptime = std::fs::read_to_string("/proc/uptime")
+                    .ok()
+                    .and_then(|u| u.split_whitespace().next().map(str::to_string))
+                    .unwrap_or_else(|| "?".into());
+                out.push(("reboot".into(), format!("board rebooted since previous run (uptime {} s)", uptime)));
+            }
+        }
+        let _ = std::fs::write(&boot_id_path, cur);
+    }
+
+    // Kernel crash records preserved across reboot (if pstore/ramoops is set up).
+    if let Ok(entries) = std::fs::read_dir("/sys/fs/pstore") {
+        for e in entries.flatten() {
+            let path = e.path();
+            let data = std::fs::read(&path).unwrap_or_default();
+            let tail = &data[data.len().saturating_sub(2048)..];
+            out.push((
+                "pstore".into(),
+                format!("{}: {}", path.display(), String::from_utf8_lossy(tail)),
+            ));
+            // Content is now in our log; remove so it's not re-reported.
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    out
+}
+
+/// Follow /dev/kmsg and report fault-looking kernel messages.
+fn spawn_kmsg_watcher(tx: &Sender<Packet>, core: &str, run_id: &str) {
+    let fd = unsafe { libc::open(c"/dev/kmsg".as_ptr(), libc::O_RDONLY) };
+    if fd < 0 {
+        eprintln!("[dut] /dev/kmsg unavailable, kernel fault watch disabled");
+        return;
+    }
+    // Skip history; previous-boot problems are covered by pstore/boot id.
+    unsafe { libc::lseek(fd, 0, libc::SEEK_END) };
+    eprintln!("[dut] watching kernel log");
+    let (tx, core, run_id) = (tx.clone(), core.to_string(), run_id.to_string());
+    thread::spawn(move || {
+        let mut buf = vec![0u8; 8192];
+        let mut window_start = Instant::now();
+        let mut sent = 0u32;
+        let mut suppressed = 0u32;
+        loop {
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if n < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EPIPE) {
+                    continue; // ring buffer overwrote unread records
+                }
+                thread::sleep(Duration::from_secs(1));
+                continue;
+            }
+            let rec = String::from_utf8_lossy(&buf[..n as usize]).to_string();
+            let Some((prio, msg)) = radbench::kmsg::parse_kmsg(&rec) else { continue };
+            let Some(cat) = radbench::kmsg::classify(prio, msg) else { continue };
+            // At most 30 reports/minute so a message storm can't flood the link.
+            if window_start.elapsed() > Duration::from_secs(60) {
+                if suppressed > 0 {
+                    eprintln!("[dut] {} kernel messages suppressed", suppressed);
+                }
+                window_start = Instant::now();
+                sent = 0;
+                suppressed = 0;
+            }
+            if sent >= 30 {
+                suppressed += 1;
+                continue;
+            }
+            sent += 1;
+            let _ = tx.send(Packet {
+                seq: 0,
+                ts: now_ms(),
+                source: format!("dut-{}", core),
+                run_id: Some(run_id.clone()),
+                event: Event::Error {
+                    core: core.clone(),
+                    test: format!("kernel:{}", cat),
+                    epoch: 0,
+                    n: 0,
+                    computed: None,
+                    expected: None,
+                    reason: format!("{}{}", msg, if suppressed > 0 { format!(" (+{} suppressed)", suppressed) } else { String::new() }),
+                },
+            });
+        }
+    });
+}
 
 extern "C" fn handle_sigusr1(_sig: libc::c_int) {
     INJECT_PENDING.store(true, Ordering::SeqCst);
@@ -38,6 +205,9 @@ fn main() {
 
     // Unique run_id so the monitor can distinguish restarts
     let run_id = format!("{:08x}", now_ms() & 0xFFFFFFFF);
+
+    let previous = previous_run_report(&log_path);
+    install_crash_handlers(&format!("{}.crash", log_path));
 
     let arch = detect_arch();
     let uname_full = detect_uname();
@@ -211,6 +381,27 @@ fn main() {
             uname: uname_full,
         },
     });
+
+    for (test, reason) in previous {
+        eprintln!("[dut] {}: {}", test, reason);
+        let _ = tx.send(Packet {
+            seq: 0,
+            ts: now_ms(),
+            source: format!("dut-{}", core),
+            run_id: Some(run_id.clone()),
+            event: Event::Error {
+                core: core.clone(),
+                test,
+                epoch: 0,
+                n: 0,
+                computed: None,
+                expected: None,
+                reason,
+            },
+        });
+    }
+
+    spawn_kmsg_watcher(&tx, &core, &run_id);
 
     // heartbeat
     let tx_hb = tx.clone();

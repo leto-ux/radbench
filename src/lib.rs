@@ -1,4 +1,5 @@
 pub mod fault;
+pub mod kmsg;
 pub mod lanes;
 pub mod liveness;
 pub mod memtest;

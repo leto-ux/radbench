@@ -70,3 +70,16 @@ Crashes and hangs produce no error packet, so the monitor raises alarms
 | `SLOW` | iteration rate below 50% of the running baseline |
 | `RESTART` | same DUT reappeared with a new `run_id` (reboot / process crash) |
 | `DISCONNECT` | TCP connection closed or timed out |
+
+## Crash, reboot and kernel fault capture (DUT)
+
+- **Kernel log**: `/dev/kmsg` is followed and fault-looking messages (panic,
+  oops, lockup/RCU stall, segfault, illegal instruction, EDAC/ECC, MMC/I/O and
+  filesystem errors, anything at err priority or worse) are sent as `error`
+  events with `test` = `kernel:<category>`; rate-limited to 30/min.
+- **Process crashes**: panics and SIGSEGV/SIGBUS/SIGILL/SIGFPE/SIGABRT are
+  written to `<RADBENCH_LOG>.crash`; the next run reports them (`test=crash`).
+- **Reboots**: the kernel boot id is compared to the previous run's
+  (`test=reboot`). If `/sys/fs/pstore` holds panic records from a previous
+  boot (enable `CONFIG_PSTORE_RAM`/ramoops), they are reported (`test=pstore`).
+- The `*_run_dut.sh` scripts restart the DUT whenever it exits.
