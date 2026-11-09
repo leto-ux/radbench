@@ -245,7 +245,7 @@ fn main() {
 
     // Register SIGUSR1 → inject a single fault
     unsafe {
-        libc::signal(libc::SIGUSR1, handle_sigusr1 as libc::sighandler_t);
+        libc::signal(libc::SIGUSR1, handle_sigusr1 as *const () as libc::sighandler_t);
     }
     eprintln!("[dut] SIGUSR1 registered for fault injection");
 

@@ -1,17 +1,58 @@
+use radbench::liveness::{Liveness, LivenessAlarm, LivenessConfig};
 use radbench::protocol::{Event, Packet, Status};
 use radbench::reference;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::mpsc::{Sender, channel};
+use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Enriched packet: the original Packet plus the peer address (for routing to per-DUT logs).
+/// `pkt: None` signals that the connection from `peer` closed.
 struct TaggedPacket {
-    pkt: Packet,
+    pkt: Option<Packet>,
     peer: String,
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+fn describe(a: &LivenessAlarm) -> String {
+    match a {
+        LivenessAlarm::Silent { source, silent_ms } => {
+            format!("ALARM ts={} {} SILENT no packets for {} ms (crash/hang/link loss?)", now_ms(), source, silent_ms)
+        }
+        LivenessAlarm::Recovered { source, outage_ms } => {
+            format!("RECOVERED ts={} {} after {} ms outage", now_ms(), source, outage_ms)
+        }
+        LivenessAlarm::Stalled { source, iter, for_ms } => {
+            format!("ALARM ts={} {} STALLED workload iter={} unchanged for {} ms", now_ms(), source, iter, for_ms)
+        }
+        LivenessAlarm::Slow { source, rate, baseline } => format!(
+            "ALARM ts={} {} SLOW {:.0} it/s vs baseline {:.0} it/s ({:.0}%)",
+            now_ms(),
+            source,
+            rate,
+            baseline,
+            100.0 * rate / baseline
+        ),
+        LivenessAlarm::Restart { source, old_run, new_run } => {
+            format!("ALARM ts={} {} RESTART run {} -> {} (reboot or process crash)", now_ms(), source, old_run, new_run)
+        }
+    }
 }
 
 /// Per-DUT state tracked by the monitor.
@@ -85,7 +126,7 @@ fn main() {
                 if let Ok(l) = line {
                     if let Ok(p) = serde_json::from_str::<Packet>(&l) {
                         let _ = tx_serial.send(TaggedPacket {
-                            pkt: p,
+                            pkt: Some(p),
                             peer: "serial".into(),
                         });
                     }
@@ -95,7 +136,13 @@ fn main() {
     }
 
     let mut seen = HashSet::new();
-    let mut last_heartbeat: HashMap<String, u64> = HashMap::new();
+    let mut liveness = Liveness::new(LivenessConfig {
+        timeout_ms: env_u64("MONITOR_TIMEOUT_MS", 5_000),
+        stall_ms: env_u64("MONITOR_STALL_MS", 5_000),
+        ..Default::default()
+    });
+    // peer address -> DUT source, to name the DUT when a connection drops
+    let mut peer_source: HashMap<String, String> = HashMap::new();
 
     // Session-level alarm log (timestamped, never overwritten)
     let alarm_path = format!("{}/alarms_{}.log", log_dir, session_ts);
@@ -109,9 +156,41 @@ fn main() {
     // Per-DUT state: keyed by source name (e.g. "dut-arm", "dut-riscv")
     let mut dut_states: HashMap<String, DutState> = HashMap::new();
 
-    for tagged in rx {
-        let pkt = tagged.pkt;
+    let raise = |alarm: &mut std::fs::File, a: &LivenessAlarm| {
+        let msg = describe(a);
+        eprintln!("{}", msg);
+        writeln!(alarm, "{}", msg).unwrap();
+        alarm.flush().unwrap();
+    };
+
+    loop {
+        let tagged = match rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(t) => t,
+            Err(RecvTimeoutError::Timeout) => {
+                for a in liveness.tick(now_ms()) {
+                    raise(&mut alarm, &a);
+                }
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
+        for a in liveness.tick(now_ms()) {
+            raise(&mut alarm, &a);
+        }
         let peer = tagged.peer;
+        let Some(pkt) = tagged.pkt else {
+            let msg = format!(
+                "DISCONNECT ts={} {} peer={}",
+                now_ms(),
+                peer_source.get(&peer).map(String::as_str).unwrap_or("unknown"),
+                peer
+            );
+            eprintln!("{}", msg);
+            writeln!(alarm, "{}", msg).unwrap();
+            alarm.flush().unwrap();
+            continue;
+        };
+        peer_source.insert(peer.clone(), pkt.source.clone());
 
         // Only deduplicate packets with non-zero sequence numbers so re-announce packets on reconnect are processed
         if pkt.seq != 0 {
@@ -123,6 +202,10 @@ fn main() {
             if !seen.insert(dedup_key) {
                 continue;
             }
+        }
+
+        for a in liveness.on_packet(&pkt.source, pkt.run_id.as_deref(), now_ms()) {
+            raise(&mut alarm, &a);
         }
 
         let run_tag = pkt
@@ -188,7 +271,9 @@ fn main() {
                     .map(|s| format!("[{}]", s.arch))
                     .unwrap_or_default();
 
-                last_heartbeat.insert(core.clone(), pkt.ts);
+                for a in liveness.on_heartbeat(&pkt.source, pkt.ts, *epoch, *iter, now_ms()) {
+                    raise(&mut alarm, &a);
+                }
                 eprintln!(
                     "heartbeat{} {}{} epoch={} iter={}",
                     run_tag, core, arch_tag, epoch, iter
@@ -386,17 +471,19 @@ fn handle_stream(stream: TcpStream, tx: Sender<TaggedPacket>) {
     eprintln!("[monitor] DUT connected from {}", peer);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
     let reader = BufReader::new(stream);
+    // Stop on any read error, including the 15 s timeout: a crashed DUT never
+    // sends FIN, so waiting for EOF would leave this connection open forever.
     for line in reader.lines() {
-        if let Ok(l) = line {
-            if let Ok(p) = serde_json::from_str::<Packet>(&l) {
-                let _ = tx.send(TaggedPacket {
-                    pkt: p,
-                    peer: peer.clone(),
-                });
-            }
+        let Ok(l) = line else { break };
+        if let Ok(p) = serde_json::from_str::<Packet>(&l) {
+            let _ = tx.send(TaggedPacket {
+                pkt: Some(p),
+                peer: peer.clone(),
+            });
         }
     }
     eprintln!("[monitor] DUT disconnected: {}", peer);
+    let _ = tx.send(TaggedPacket { pkt: None, peer });
 }
 
 /// Generate a filesystem-safe timestamp for log filenames.

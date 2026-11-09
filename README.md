@@ -56,3 +56,17 @@ afterwards, so the DUT keeps as much state under test as possible:
 
 `scrub` summary packets carry `bytes` and `passes`, giving the bit·seconds of
 exposure needed to compute a per-bit cross-section (upsets / fluence / bits).
+
+## Liveness alarms (monitor)
+
+Crashes and hangs produce no error packet, so the monitor raises alarms
+(written to `logs/alarms_*.log`) from the heartbeat stream:
+
+| Alarm | Meaning |
+|-------|---------|
+| `SILENT` | no packet for `MONITOR_TIMEOUT_MS` (default 5000) — crash, hang, link loss |
+| `RECOVERED` | packets resumed; reports the outage length |
+| `STALLED` | heartbeats arrive but the workload counter has not moved for `MONITOR_STALL_MS` |
+| `SLOW` | iteration rate below 50% of the running baseline |
+| `RESTART` | same DUT reappeared with a new `run_id` (reboot / process crash) |
+| `DISCONNECT` | TCP connection closed or timed out |
