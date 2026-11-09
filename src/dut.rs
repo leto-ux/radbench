@@ -20,6 +20,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 static INJECT_PENDING: AtomicBool = AtomicBool::new(false);
 // UDP "flipreg" sets this, register workload consumes it
 static REG_INJECT_PENDING: AtomicBool = AtomicBool::new(false);
+// UDP "flipmem" sets this, the DRAM scrubber consumes it before its next pass
+static MEM_INJECT_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// fd of the crash-marker file, written from fatal-signal handlers.
 static CRASH_FD: AtomicI32 = AtomicI32::new(-1);
@@ -462,6 +464,10 @@ fn main() {
                                 REG_INJECT_PENDING.store(true, Ordering::SeqCst);
                                 eprintln!("[control] register fault requested from {}", src);
                             }
+                            "flipmem" => {
+                                MEM_INJECT_PENDING.store(true, Ordering::SeqCst);
+                                eprintln!("[control] memory fault requested from {}", src);
+                            }
                             "status" => {
                                 let _ = sock.send_to(b"ok\n", src);
                             }
@@ -807,6 +813,11 @@ fn spawn_scrubbers(tx: &Sender<Packet>, core: &str, run_id: &str, cpu: usize) {
             let mut agg = (0, 0, 0);
             loop {
                 thread::sleep(mem_interval);
+                if MEM_INJECT_PENDING.swap(false, Ordering::SeqCst) {
+                    let word = (now_ms() as usize).wrapping_mul(2_654_435_761) % (region.bytes() / 8);
+                    region.flip_bit(word, (now_ms() % 64) as u32);
+                    eprintln!("[dut] synthetic memory fault injected at word {}", word);
+                }
                 scrub_and_report(&mut region, "mem", &tx, &core, &run_id, &mut agg, 1);
             }
         });

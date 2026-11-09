@@ -36,10 +36,12 @@ RADBENCH_FAULT_RATE=5e-9 RADBENCH_FAULT_MODE=tid RADBENCH_FAULT_ACCEL=2.0 ./radb
 > For TID, epoch *k* multiplies by `accel^k`, so faults grow as
 > `rate × 10M × accel^k`.
 
-Bit flips
+Bit flips (synthetic, to validate the whole chain before beam time)
 
 ```sh
-echo "flip" | nc -u 192.168.42.1 9001
+echo "flip"    | nc -u 192.168.42.1 9001   # fib state
+echo "flipreg" | nc -u 192.168.42.1 9001   # register workload lane
+echo "flipmem" | nc -u 192.168.42.1 9001   # DRAM scrub region (seen at next scrub)
 ```
 
 ## Test surface
