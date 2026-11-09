@@ -1,4 +1,5 @@
 use radbench::fault::{FaultInjector, FaultMode, FaultTarget};
+use radbench::memtest::MemRegion;
 use radbench::protocol::{Event, Packet, Status};
 use radbench::reference;
 use radbench::workload::FibState;
@@ -229,32 +230,8 @@ fn main() {
         }
     });
 
-    // mem march
-    let tx_mem = tx.clone();
-    let core_mem = core.clone();
-    let run_id_mem = run_id.clone();
-    thread::spawn(move || {
-        loop {
-            thread::sleep(Duration::from_secs(10));
-            if let Some(reason) = mem_march() {
-                let _ = tx_mem.send(Packet {
-                    seq: 0,
-                    ts: now_ms(),
-                    source: format!("dut-{}", core_mem),
-                    run_id: Some(run_id_mem.clone()),
-                    event: Event::Error {
-                        core: core_mem.clone(),
-                        test: "mem_march".into(),
-                        epoch: 0,
-                        n: 0,
-                        computed: None,
-                        expected: None,
-                        reason,
-                    },
-                });
-            }
-        }
-    });
+    // memory upset scrubbers (large DRAM region + small cache-resident region)
+    spawn_scrubbers(&tx, &core, &run_id, cpu);
 
     // Register SIGUSR1 → inject a single fault
     unsafe {
@@ -451,18 +428,125 @@ fn run_fib(
     }
 }
 
-fn mem_march() -> Option<String> {
-    let size = 1 << 20;
-    let mut buf = vec![0u8; size];
-    for (i, b) in buf.iter_mut().enumerate() {
-        *b = (i & 0xFF) as u8;
+/// Size of the DRAM test region: RADBENCH_MEM_MB, or by default half of
+/// MemAvailable so as many cells as possible are under test.
+fn mem_region_bytes() -> usize {
+    if let Some(mb) = std::env::var("RADBENCH_MEM_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        return mb << 20;
     }
-    for (i, b) in buf.iter().enumerate() {
-        if *b != ((i & 0xFF) as u8) {
-            return Some(format!("mem mismatch at offset {}", i));
-        }
+    let avail_kb = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("MemAvailable:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|v| v.parse::<usize>().ok())
+        })
+        .unwrap_or(16 << 10);
+    ((avail_kb << 10) / 2).clamp(1 << 20, 1 << 30)
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// Run one scrub and forward its upsets + summary to the logger.
+fn scrub_and_report(
+    region: &mut MemRegion,
+    test: &str,
+    tx: &Sender<Packet>,
+    core: &str,
+    run_id: &str,
+    agg: &mut (u64, u64, u64),
+    summary_every: u64,
+) {
+    let start = Instant::now();
+    let rep = region.scrub();
+    let dur = start.elapsed().as_micros() as u64;
+    let mk = |event| Packet {
+        seq: 0,
+        ts: now_ms(),
+        source: format!("dut-{}", core),
+        run_id: Some(run_id.to_string()),
+        event,
+    };
+    for u in &rep.upsets {
+        let _ = tx.send(mk(Event::Upset {
+            core: core.to_string(),
+            test: test.to_string(),
+            scrub: rep.scrub,
+            offset: u.offset as u64,
+            expected: format!("{:016x}", u.expected),
+            actual: format!("{:016x}", u.actual),
+            flipped_bits: u.flipped_bits(),
+            persistent: u.persistent,
+        }));
     }
-    None
+    agg.0 += 1;
+    agg.1 += rep.bad_words as u64;
+    agg.2 += rep.bad_bits;
+    if agg.0 >= summary_every || rep.bad_words > 0 {
+        let _ = tx.send(mk(Event::Scrub {
+            core: core.to_string(),
+            test: test.to_string(),
+            bytes: region.bytes() as u64,
+            passes: agg.0,
+            bad_words: agg.1,
+            bad_bits: agg.2,
+            duration_us: dur,
+        }));
+        *agg = (0, 0, 0);
+    }
+}
+
+fn spawn_scrubbers(tx: &Sender<Packet>, core: &str, run_id: &str, cpu: usize) {
+    // Large DRAM-resident region: held for the whole run, scrubbed slowly so
+    // upsets accumulate between reads (DRAM cells keep flips until rewritten).
+    let mem_bytes = mem_region_bytes();
+    let mem_interval = Duration::from_secs(env_u64("RADBENCH_MEM_SCRUB_S", 10).max(1));
+    {
+        let (tx, core, run_id) = (tx.clone(), core.to_string(), run_id.to_string());
+        thread::spawn(move || {
+            core_affinity::set_for_current(core_affinity::CoreId { id: cpu });
+            let mut region = MemRegion::new(mem_bytes, 6, 64);
+            eprintln!(
+                "[dut] mem scrub region: {} MiB every {:?}",
+                region.bytes() >> 20,
+                mem_interval
+            );
+            let mut agg = (0, 0, 0);
+            loop {
+                thread::sleep(mem_interval);
+                scrub_and_report(&mut region, "mem", &tx, &core, &run_id, &mut agg, 1);
+            }
+        });
+    }
+
+    // Small cache-resident region: re-read often enough to stay in L1/L2 so
+    // flips in the SRAM cache arrays are observed before the line is evicted
+    // (an upset in a clean line that gets evicted is silently lost).
+    let cache_kb = env_u64("RADBENCH_CACHE_KB", 16) as usize;
+    if cache_kb > 0 {
+        let interval = Duration::from_millis(env_u64("RADBENCH_CACHE_SCRUB_MS", 20).max(1));
+        let summary_every = (10_000 / interval.as_millis().max(1) as u64).max(1);
+        let (tx, core, run_id) = (tx.clone(), core.to_string(), run_id.to_string());
+        thread::spawn(move || {
+            core_affinity::set_for_current(core_affinity::CoreId { id: cpu });
+            let mut region = MemRegion::new(cache_kb << 10, 500, 64);
+            eprintln!("[dut] cache scrub region: {} KiB every {:?}", cache_kb, interval);
+            let mut agg = (0, 0, 0);
+            loop {
+                thread::sleep(interval);
+                scrub_and_report(&mut region, "cache", &tx, &core, &run_id, &mut agg, summary_every);
+            }
+        });
+    }
 }
 
 fn read_temp() -> Option<i32> {

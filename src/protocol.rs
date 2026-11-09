@@ -53,6 +53,34 @@ pub enum Event {
         reason: String,
         final_iter: u64,
     },
+    /// A single corrupted word found by a memory scrub.
+    #[serde(rename = "upset")]
+    Upset {
+        core: String,
+        /// Which region: "mem" (DRAM-resident) or "cache" (L1-resident).
+        test: String,
+        scrub: u64,
+        offset: u64,
+        expected: String,
+        actual: String,
+        flipped_bits: u32,
+        /// Same word was also wrong in the previous scrub (hard/stuck fault).
+        persistent: bool,
+    },
+    /// Summary of one or more scrub passes. `bytes × interval` is the
+    /// exposure needed to turn upset counts into a cross-section.
+    #[serde(rename = "scrub")]
+    Scrub {
+        core: String,
+        test: String,
+        bytes: u64,
+        /// Passes aggregated into this summary.
+        passes: u64,
+        bad_words: u64,
+        bad_bits: u64,
+        /// Wall time spent reading for the last pass.
+        duration_us: u64,
+    },
     #[serde(rename = "announce")]
     Announce {
         core: String,

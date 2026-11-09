@@ -41,3 +41,17 @@ Bit flips
 ```sh
 echo "flip" | nc -u 192.168.42.1 9001
 ```
+
+## Test surface
+
+A fault is only observable if the hit bit holds known data and is read back
+afterwards, so the DUT keeps as much state under test as possible:
+
+| Test | What it covers | Config (env) |
+|------|----------------|--------------|
+| `fib` | Integer datapath + a few registers, checked against build-time SHA-256 checkpoints | — |
+| `mem` | Large DRAM-resident pattern held for the whole run and scrubbed periodically. Address-unique, ~50% ones, polarity inverted every 6 scrubs. Upsets are corrected and reported per word; a word failing two scrubs in a row is flagged `persistent` (stuck/TID). | `RADBENCH_MEM_MB` (default: ½ of MemAvailable), `RADBENCH_MEM_SCRUB_S` (default 10) |
+| `cache` | Small region re-read often so it stays resident in L1/L2 SRAM | `RADBENCH_CACHE_KB` (default 16, 0 = off), `RADBENCH_CACHE_SCRUB_MS` (default 20) |
+
+`scrub` summary packets carry `bytes` and `passes`, giving the bit·seconds of
+exposure needed to compute a per-bit cross-section (upsets / fluence / bits).

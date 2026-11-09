@@ -202,6 +202,54 @@ fn main() {
                 writeln!(alarm, "{}", msg).unwrap();
                 alarm.flush().unwrap();
             }
+            Event::Upset {
+                core,
+                test,
+                scrub,
+                offset,
+                expected,
+                actual,
+                flipped_bits,
+                persistent,
+            } => {
+                let msg = format!(
+                    "ALARM ts={}{} core={} UPSET test={} scrub={} offset=0x{:x} expected={} actual={} bits={}{}",
+                    pkt.ts,
+                    run_tag,
+                    core,
+                    test,
+                    scrub,
+                    offset,
+                    expected,
+                    actual,
+                    flipped_bits,
+                    if *persistent { " PERSISTENT" } else { "" }
+                );
+                eprintln!("{}", msg);
+                writeln!(alarm, "{}", msg).unwrap();
+                alarm.flush().unwrap();
+            }
+            Event::Scrub {
+                core,
+                test,
+                bytes,
+                passes,
+                bad_words,
+                bad_bits,
+                duration_us,
+            } => {
+                eprintln!(
+                    "scrub{} {} test={} {} KiB passes={} bad_words={} bad_bits={} ({}µs)",
+                    run_tag,
+                    core,
+                    test,
+                    bytes >> 10,
+                    passes,
+                    bad_words,
+                    bad_bits,
+                    duration_us
+                );
+            }
             Event::Shutdown {
                 core,
                 reason,
