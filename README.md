@@ -50,6 +50,7 @@ afterwards, so the DUT keeps as much state under test as possible:
 | Test | What it covers | Config (env) |
 |------|----------------|--------------|
 | `fib` | Integer datapath + a few registers, checked against build-time SHA-256 checkpoints | — |
+| `regs` | 20 integer + 24 FP lanes kept live in registers in a tight loop (verified spill-free on aarch64/riscv64). Integer lanes are odd-multiplier LCGs (a flip is never masked), FP lanes are scaled ×2/×0.5 (exact). Checked every 1M steps against build-time references; mismatches name the lane and flipped bits. Inject with `echo flipreg \| nc -u <ip> 9001`. | `RADBENCH_REGS=0` disables |
 | `mem` | Large DRAM-resident pattern held for the whole run and scrubbed periodically. Address-unique, ~50% ones, polarity inverted every 6 scrubs. Upsets are corrected and reported per word; a word failing two scrubs in a row is flagged `persistent` (stuck/TID). | `RADBENCH_MEM_MB` (default: ½ of MemAvailable), `RADBENCH_MEM_SCRUB_S` (default 10) |
 | `cache` | Small region re-read often so it stays resident in L1/L2 SRAM | `RADBENCH_CACHE_KB` (default 16, 0 = off), `RADBENCH_CACHE_SCRUB_MS` (default 20) |
 

@@ -3,6 +3,10 @@ use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
+#[path = "lanes.rs"]
+#[allow(dead_code)]
+mod lanes;
+
 // calculate hashes to compare the dut outputs against during compile time
 fn main() {
     let out_dir = std::env::var("OUT_DIR").unwrap();
@@ -24,7 +28,26 @@ fn main() {
     }
     writeln!(f, "];").unwrap();
 
+    // Register-workload reference: integer lane values at each checkpoint.
+    let dest = Path::new(&out_dir).join("lane_reference.rs");
+    let mut f = File::create(&dest).unwrap();
+    let mut x = lanes::int_seeds();
+    writeln!(
+        f,
+        "pub static LANE_CHECKPOINTS: [[u64; {}]; {}] = [",
+        lanes::INT_LANES,
+        lanes::CHECKS_PER_EPOCH
+    )
+    .unwrap();
+    for _ in 0..lanes::CHECKS_PER_EPOCH {
+        lanes::int_advance(&mut x, lanes::STEPS_PER_CHECK);
+        let vals: Vec<String> = x.iter().map(|v| format!("0x{:016x}", v)).collect();
+        writeln!(f, "    [{}],", vals.join(", ")).unwrap();
+    }
+    writeln!(f, "];").unwrap();
+
     println!("cargo:rerun-if-changed=src/build.rs");
+    println!("cargo:rerun-if-changed=src/lanes.rs");
 }
 
 fn fib_u128_at(n: u64) -> (u128, u128) {

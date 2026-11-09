@@ -148,11 +148,17 @@ fn main() {
                 elapsed_us,
                 ..
             } => {
-                let expected = checkpoints
-                    .iter()
-                    .find(|c| c.n == *n)
-                    .map(|c| c.expected_hash);
-                let ok = expected.map(|e| e == hash.as_str()).unwrap_or(false);
+                // Only the fib test can be re-verified here; other tests
+                // (e.g. "regs") are self-checked on the DUT via `status`.
+                let expected = if test == "fib" {
+                    checkpoints
+                        .iter()
+                        .find(|c| c.n == *n)
+                        .map(|c| c.expected_hash)
+                } else {
+                    None
+                };
+                let ok = test != "fib" || expected.map(|e| e == hash.as_str()).unwrap_or(false);
 
                 let arch_tag = dut_states
                     .get(&pkt.source)

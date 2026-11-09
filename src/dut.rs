@@ -1,5 +1,7 @@
 use radbench::fault::{FaultInjector, FaultMode, FaultTarget};
+use radbench::lanes;
 use radbench::memtest::MemRegion;
+use radbench::regs::RegWorkload;
 use radbench::protocol::{Event, Packet, Status};
 use radbench::reference;
 use radbench::workload::FibState;
@@ -16,6 +18,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // Global flag: SIGUSR1 or UDP "flip" sets this, fib loop consumes it
 static INJECT_PENDING: AtomicBool = AtomicBool::new(false);
+// UDP "flipreg" sets this, register workload consumes it
+static REG_INJECT_PENDING: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn handle_sigusr1(_sig: libc::c_int) {
     INJECT_PENDING.store(true, Ordering::SeqCst);
@@ -233,6 +237,12 @@ fn main() {
     // memory upset scrubbers (large DRAM region + small cache-resident region)
     spawn_scrubbers(&tx, &core, &run_id, cpu);
 
+    // register-file / datapath workload
+    if env_u64("RADBENCH_REGS", 1) != 0 {
+        let (tx, core, run_id) = (tx.clone(), core.clone(), run_id.clone());
+        thread::spawn(move || run_regs(&core, &tx, &run_id, cpu));
+    }
+
     // Register SIGUSR1 → inject a single fault
     unsafe {
         libc::signal(libc::SIGUSR1, handle_sigusr1 as libc::sighandler_t);
@@ -256,6 +266,10 @@ fn main() {
                             "flip" => {
                                 INJECT_PENDING.store(true, Ordering::SeqCst);
                                 eprintln!("[control] fault requested from {}", src);
+                            }
+                            "flipreg" => {
+                                REG_INJECT_PENDING.store(true, Ordering::SeqCst);
+                                eprintln!("[control] register fault requested from {}", src);
                             }
                             "status" => {
                                 let _ = sock.send_to(b"ok\n", src);
@@ -391,6 +405,7 @@ fn run_fib(
                     status,
                     temp_milli: read_temp(),
                     elapsed_us: elapsed,
+                    passes: None,
                 },
             })
             .unwrap();
@@ -424,6 +439,84 @@ fn run_fib(
                 epoch_counter.store(state.epoch, Ordering::Relaxed);
                 cp_idx = 0;
             }
+        }
+    }
+}
+
+fn run_regs(core: &str, tx: &Sender<Packet>, run_id: &str, cpu: usize) {
+    core_affinity::set_for_current(core_affinity::CoreId { id: cpu });
+    eprintln!(
+        "[dut] register workload: {} int + {} fp lanes",
+        lanes::INT_LANES,
+        lanes::FP_LANES
+    );
+    let mk = |event| Packet {
+        seq: 0,
+        ts: now_ms(),
+        source: format!("dut-{}", core),
+        run_id: Some(run_id.to_string()),
+        event,
+    };
+    let mut w = RegWorkload::new();
+    let mut last_ok_report = Instant::now() - Duration::from_secs(10);
+    let mut passes_since_report = 0u64;
+    loop {
+        for idx in 0..lanes::CHECKS_PER_EPOCH {
+            let start = Instant::now();
+            w.advance(lanes::STEPS_PER_CHECK);
+            if REG_INJECT_PENDING.swap(false, Ordering::SeqCst) {
+                let lane = (w.n as usize / 7) % lanes::INT_LANES;
+                w.flip_int(lane, (w.n % 64) as u32);
+                eprintln!("[dut] synthetic register fault injected in int lane {}", lane);
+            }
+            let res = w.check(idx);
+            let elapsed = start.elapsed().as_micros() as u64;
+            passes_since_report += 1;
+            // OK checks are rate-limited to ~1/s (each packet is fsynced);
+            // mismatches are always reported.
+            if res.passed() && last_ok_report.elapsed() < Duration::from_secs(1) {
+                continue;
+            }
+            last_ok_report = Instant::now();
+            let fold = w.int.iter().fold(0u64, |a, x| a.rotate_left(7) ^ x);
+            let _ = tx.send(mk(Event::Checkpoint {
+                core: core.to_string(),
+                test: "regs".into(),
+                epoch: w.epoch,
+                n: w.n,
+                hash: format!("{:016x}", fold),
+                status: if res.passed() { Status::Ok } else { Status::Mismatch },
+                temp_milli: read_temp(),
+                elapsed_us: elapsed,
+                passes: Some(std::mem::take(&mut passes_since_report)),
+            }));
+            if !res.passed() {
+                let detail: Vec<String> = res
+                    .int_bad
+                    .iter()
+                    .map(|(l, x)| format!("int[{}]^{:016x}", l, x))
+                    .chain(res.fp_bad.iter().map(|(l, x)| format!("fp[{}]^{:016x}", l, x)))
+                    .collect();
+                let _ = tx.send(mk(Event::Error {
+                    core: core.to_string(),
+                    test: "regs".into(),
+                    epoch: w.epoch,
+                    n: w.n,
+                    computed: None,
+                    expected: None,
+                    reason: format!(
+                        "register lane mismatch ({} bits): {}",
+                        res.flipped_bits(),
+                        detail.join(" ")
+                    ),
+                }));
+                // Resync so one upset isn't re-reported at every later check.
+                w.reset_epoch();
+                break;
+            }
+        }
+        if w.n == lanes::STEPS_PER_CHECK * lanes::CHECKS_PER_EPOCH as u64 {
+            w.reset_epoch();
         }
     }
 }

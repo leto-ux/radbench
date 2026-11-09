@@ -23,6 +23,9 @@ pub enum Event {
         status: Status,
         temp_milli: Option<i32>,
         elapsed_us: u64,
+        /// Checks aggregated into this packet (rate-limited tests); absent = 1.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        passes: Option<u64>,
     },
     #[serde(rename = "heartbeat")]
     Heartbeat {
