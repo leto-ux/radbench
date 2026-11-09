@@ -60,6 +60,8 @@ def parse_log(path: Path, run_id: str):
     checkpoints = []
     gaps = []
     all_ts = []
+    scrub = {}          # test -> {"bytes", "passes", "first_ts", "last_ts"}
+    corrupted = set()   # (test, epoch) already counted for compute workloads
     prev_seq = None
     prev_ts = None
 
@@ -112,24 +114,50 @@ def parse_log(path: Path, run_id: str):
                     "status": ev["status"],
                     "temp_milli": ev.get("temp_milli"),
                 }
+                cp["test"] = ev.get("test", "fib")
                 checkpoints.append(cp)
-                if ev["status"] != "ok":
-                    failures.append({
-                        "ts": pkt["ts"],
-                        "epoch": ev["epoch"],
-                        "n": ev["n"],
-                        "reason": f"checkpoint {ev['status']}",
-                        "kind": "mismatch",
-                    })
+                # A mismatching checkpoint is always accompanied by an
+                # "error" event, which is what gets counted below.
 
             elif ev_type == "error":
+                test = ev.get("test", "")
+                epoch = ev.get("epoch", 0)
+                reason = ev.get("reason", "")
+                # Older logs: one upset failed every later checkpoint of the
+                # epoch. Count a compute-workload upset once per epoch.
+                if test in ("fib", "regs") and "synthetic" not in reason:
+                    if (test, epoch) in corrupted:
+                        continue
+                    corrupted.add((test, epoch))
                 failures.append({
                     "ts": pkt["ts"],
-                    "epoch": ev.get("epoch", 0),
+                    "epoch": epoch,
                     "n": ev.get("n", 0),
-                    "reason": ev.get("reason", ""),
-                    "kind": "error",
+                    "reason": reason,
+                    "kind": test or "error",
                 })
+
+            elif ev_type == "upset":
+                failures.append({
+                    "ts": pkt["ts"],
+                    "epoch": 0,
+                    "n": 0,
+                    "reason": f"{ev.get('flipped_bits', 1)} bit(s) @0x{ev.get('offset', 0):x}"
+                              + (" persistent" if ev.get("persistent") else ""),
+                    "kind": ev.get("test", "mem"),
+                    "bits": ev.get("flipped_bits", 1),
+                })
+
+            elif ev_type == "scrub":
+                t = scrub.setdefault(ev.get("test", "mem"), {
+                    "bytes": ev.get("bytes", 0), "passes": 0,
+                    "bad_words": 0, "bad_bits": 0,
+                    "first_ts": pkt["ts"], "last_ts": pkt["ts"]})
+                t["bytes"] = ev.get("bytes", t["bytes"])
+                t["passes"] += ev.get("passes", 1)
+                t["bad_words"] += ev.get("bad_words", 0)
+                t["bad_bits"] += ev.get("bad_bits", 0)
+                t["last_ts"] = pkt["ts"]
 
     return {
         "source": source or path.stem,
@@ -138,6 +166,7 @@ def parse_log(path: Path, run_id: str):
         "checkpoints": checkpoints,
         "gaps": gaps,
         "all_ts": all_ts,
+        "scrub": scrub,
     }
 
 
@@ -246,28 +275,33 @@ def plot_failures(run_id: str, dut_data: list[dict], output: Path):
     # ── Panel 2: checkpoint pass rate per epoch (degradation curve) ───────
     ax_pass = axes[1]
     for i, d in enumerate(dut_data):
-        if not d["checkpoints"]:
-            continue
-        # Group checkpoints by epoch
-        epoch_total: dict[int, int] = {}
-        epoch_ok: dict[int, int] = {}
-        for cp in d["checkpoints"]:
-            e = cp["epoch"]
-            epoch_total[e] = epoch_total.get(e, 0) + 1
-            if cp["status"] == "ok":
-                epoch_ok[e] = epoch_ok.get(e, 0) + 1
+        # Only fib reports every checkpoint; "regs" OK checkpoints are
+        # rate-limited, so a per-epoch pass rate would be meaningless there.
+        tests = sorted({cp["test"] for cp in d["checkpoints"]} & {"fib"})
+        for ti, test in enumerate(tests):
+            # Group checkpoints by epoch
+            epoch_total: dict[int, int] = {}
+            epoch_ok: dict[int, int] = {}
+            for cp in d["checkpoints"]:
+                if cp["test"] != test:
+                    continue
+                e = cp["epoch"]
+                epoch_total[e] = epoch_total.get(e, 0) + 1
+                if cp["status"] == "ok":
+                    epoch_ok[e] = epoch_ok.get(e, 0) + 1
 
-        epochs = sorted(epoch_total)
-        pass_rate = [epoch_ok.get(e, 0) / epoch_total[e] for e in epochs]
+            epochs = sorted(epoch_total)
+            pass_rate = [epoch_ok.get(e, 0) / epoch_total[e] for e in epochs]
 
-        label = f'{d["source"]} ({d["arch"]})'
-        ax_pass.plot(epochs, pass_rate, color=colors[i % len(colors)],
-                     linewidth=1, alpha=0.8, label=label)
+            label = f'{d["source"]} ({d["arch"]})'
+            ax_pass.plot(epochs, pass_rate, color=colors[i % len(colors)],
+                         linewidth=1, alpha=0.8, label=label,
+                         linestyle=["-", "--", ":", "-."][ti % 4])
 
     ax_pass.set_ylabel("Checkpoint pass rate")
     ax_pass.set_xlabel("Epoch")
     ax_pass.set_title(
-        "Checkpoint pass rate per epoch (1.0 = healthy, 0.0 = fully degraded)")
+        "fib checkpoint pass rate per epoch (1.0 = healthy, 0.0 = fully degraded)")
     ax_pass.set_ylim(-0.05, 1.05)
     ax_pass.axhline(1.0, color="green", linewidth=0.5, alpha=0.4)
     ax_pass.axhline(0.0, color="red", linewidth=0.5, alpha=0.4)
@@ -311,6 +345,8 @@ def plot_failures(run_id: str, dut_data: list[dict], output: Path):
             continue
         epoch_counts: dict[int, int] = {}
         for f in d["failures"]:
+            if f["kind"] != "fib":
+                continue
             epoch_counts[f["epoch"]] = epoch_counts.get(f["epoch"], 0) + 1
         epochs = sorted(epoch_counts)
         counts = [epoch_counts[e] for e in epochs]
@@ -323,7 +359,7 @@ def plot_failures(run_id: str, dut_data: list[dict], output: Path):
 
     ax_epoch.set_ylabel("Failures in epoch")
     ax_epoch.set_xlabel("Epoch")
-    ax_epoch.set_title("Failures per epoch")
+    ax_epoch.set_title("fib failures per epoch")
     ax_epoch.legend(loc="upper left", fontsize=9)
     ax_epoch.grid(True, axis="y", alpha=0.3)
     ax_epoch.yaxis.set_major_locator(ticker.MaxNLocator(integer=True))
@@ -374,12 +410,15 @@ def print_summary(run_id: str, dut_data: list[dict]):
     print(f"  Run {run_id} \u2014 failure summary")
     print(f"{'=' * 72}")
     for d in dut_data:
-        n_err = sum(1 for f in d["failures"] if f["kind"] == "error")
-        n_mis = sum(1 for f in d["failures"] if f["kind"] == "mismatch")
+        by_kind: dict[str, int] = {}
+        for f in d["failures"]:
+            by_kind[f["kind"]] = by_kind.get(f["kind"], 0) + 1
         n_cp = len(d["checkpoints"])
         n_ok = sum(1 for cp in d["checkpoints"] if cp["status"] == "ok")
-        epochs = set(cp["epoch"] for cp in d["checkpoints"])
-        fail_epochs = set(f["epoch"] for f in d["failures"])
+        # Epoch statistics refer to the fib workload (other tests have
+        # their own epoch counters or none).
+        epochs = set(cp["epoch"] for cp in d["checkpoints"] if cp["test"] == "fib")
+        fail_epochs = set(f["epoch"] for f in d["failures"] if f["kind"] == "fib")
 
         # Compute run duration and MTBF
         t0 = _t0_for(d)
@@ -387,7 +426,7 @@ def print_summary(run_id: str, dut_data: list[dict]):
         if not all_ts:
             all_ts = [cp["ts"] for cp in d["checkpoints"]] + [f["ts"] for f in d["failures"]]
         duration_s = (max(all_ts) - t0) / 1000.0 if all_ts else 0
-        n_fail_total = n_err + n_mis
+        n_fail_total = len(d["failures"])
         mtbf_s = duration_s / n_fail_total if n_fail_total > 0 else float("inf")
 
         # Cross-section: fraction of epochs that had at least one failure
@@ -399,10 +438,18 @@ def print_summary(run_id: str, dut_data: list[dict]):
         print(f"    Run duration      : {duration_s:.1f} s")
         print(f"    Checkpoints total : {n_cp}  (ok: {n_ok})")
         print(f"    Epochs seen       : {len(epochs)}")
-        print(f"    Error events      : {n_err}")
-        print(f"    Mismatch events   : {n_mis}")
         print(f"    Total failures    : {n_fail_total}")
-        print(f"    Affected epochs   : {sorted(fail_epochs)}")
+        for kind in sorted(by_kind):
+            print(f"      {kind:<16}: {by_kind[kind]}")
+        for test, t in sorted(d.get("scrub", {}).items()):
+            dur = max((t["last_ts"] - t["first_ts"]) / 1000.0, 1e-9)
+            mbit = t["bytes"] * 8 / 1e6
+            upsets = sum(1 for f in d["failures"] if f["kind"] == test)
+            rate = upsets / (mbit * dur / 3600.0) if dur > 1 else float("nan")
+            print(f"    Scrub '{test}'      : {t['bytes'] / 2**20:.2f} MiB held for ~{dur:.0f} s, "
+                  f"{t['passes']} passes, {t['bad_bits']} bad bits, "
+                  f"{rate:.3g} upsets/(Mbit\u00b7h)")
+        print(f"    Affected fib epochs: {sorted(fail_epochs)}")
         print(f"    Epoch cross-sect. : {cross_section:.4f}  "
               f"({len(fail_epochs)}/{len(epochs)} epochs)")
         if mtbf_s != float("inf"):

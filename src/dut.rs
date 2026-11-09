@@ -627,8 +627,10 @@ fn run_fib(
             }
 
             cp_idx += 1;
-            if cp_idx >= checkpoints.len() {
-                // Epoch complete — reset for next cycle
+            // Epoch complete — or corrupted: once the state is wrong every
+            // later checkpoint of this epoch fails too, so restart right away
+            // (one report per upset, and the test is live again immediately).
+            if cp_idx >= checkpoints.len() || !result.passed {
                 if let Some(ref mut fi) = fault_injector {
                     fi.on_epoch_end();
                 }
